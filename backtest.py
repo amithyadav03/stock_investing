@@ -95,7 +95,7 @@ def render_chart(df: pd.DataFrame, symbol: str, label: str) -> str:
 def load_prompt(filename: str) -> tuple[str, str]:
     """Loads a prompt file and splits it into system and user parts by '---'"""
     path = os.path.join(os.path.dirname(__file__), "prompts", filename)
-    with open(path, "r") as f:
+    with open(path, "r", encoding="utf-8") as f:
         content = f.read()
     parts = content.split("---")
     return parts[0].strip(), parts[1].strip()
@@ -104,20 +104,8 @@ def get_ai_decision(symbol: str, technicals: dict, chart_path: str, cutoff_price
     """Ask the LLM for a trade decision based on the historical snapshot."""
     llm = get_llm()
     if not llm:
-        print(f"  [MOCK] No OpenAI key — generating mock decision for {symbol}")
-        atr = technicals.get("atr", 2.0)
-        return RiskDecision(
-            chain_of_thought_1_technicals="Mock: RSI neutral, price in mid-band",
-            chain_of_thought_2_fundamentals="Mock: Fair valuation",
-            chain_of_thought_3_risk="Mock: ATR based SL applied",
-            proposed_action="BUY",
-            proposed_entry=cutoff_price,
-            proposed_stop_loss=round(cutoff_price - (atr * 2), 2),
-            proposed_take_profit=round(cutoff_price * 1.06, 2),
-            risk_percentage=0.05,
-            expected_holding_days=14,
-            final_rationale="Mock backtest decision"
-        )
+        print(f"  [Error] No OpenAI key found. Skipping {symbol}")
+        return None
     
     try:
         structured_llm = llm.with_structured_output(RiskDecision)

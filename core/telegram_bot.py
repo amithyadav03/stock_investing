@@ -57,3 +57,25 @@ def send_telegram_trade_proposal(
         print("[Telegram] Proposal sent successfully.")
     except Exception as e:
         print(f"[Telegram] Failed to send: {e}")
+
+def notify_error(symbol: str, error_msg: str):
+    """Sends a technical error notification to Telegram."""
+    text = (
+        f"⚠️ **TECHNICAL ERROR IN ANALYSIS**\n\n"
+        f"**Symbol**: {symbol}\n"
+        f"**Status**: Failed to generate trade decision.\n\n"
+        f"**Rationale**: {error_msg}\n\n"
+        f"_{symbol} skipped for safety._"
+    )
+    url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": settings.TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "Markdown"
+    }
+    try:
+        response = requests.post(url, json=payload)
+        response.raise_for_status()
+        print(f"[Telegram] Error alert sent for {symbol}.")
+    except Exception as e:
+        print(f"[Telegram] Failed to send error alert: {e}")

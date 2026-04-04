@@ -21,7 +21,7 @@ def encode_image(image_path: str) -> str:
 def load_prompt(filename: str) -> tuple[str, str]:
     """Loads a prompt file and splits it into system and user parts by '---'"""
     path = os.path.join(os.path.dirname(__file__), "..", "prompts", filename)
-    with open(path, "r") as f:
+    with open(path, "r", encoding="utf-8") as f:
         content = f.read()
     parts = content.split("---")
     return parts[0].strip(), parts[1].strip()
@@ -103,19 +103,31 @@ def risk_manager_node(state: AgentState) -> dict:
             decision = structured_llm.invoke([SystemMessage(content=sys_template), HumanMessage(content=prompt)])
         except Exception as e:
             print(f"LLM Parsing failed: {e}")
+            decision = RiskDecision(
+                chain_of_thought_1_technicals="FAILED",
+                chain_of_thought_2_fundamentals="FAILED",
+                chain_of_thought_3_risk="FAILED",
+                proposed_action="ERROR",
+                proposed_entry=tech.get('latest_price', 0.0),
+                proposed_stop_loss=0.0,
+                proposed_take_profit=0.0,
+                risk_percentage=0.0,
+                expected_holding_days=0,
+                final_rationale=f"AI Reasoning Error: {e}"
+            )
             
     if not decision: 
         decision = RiskDecision(
-            chain_of_thought_1_technicals="Mock",
-            chain_of_thought_2_fundamentals="Mock",
-            chain_of_thought_3_risk="Mock",
-            proposed_action="BUY",
-            proposed_entry=tech.get('latest_price', 100.0),
-            proposed_stop_loss=tech.get('latest_price', 100.0) - (tech.get('atr_14', 2.0) * 2),
-            proposed_take_profit=tech.get('latest_price', 100.0) * 1.05,
-            risk_percentage=0.05,
-            expected_holding_days=14,
-            final_rationale="Simulated safe trade driven by fallback."
+            chain_of_thought_1_technicals="FAILED",
+            chain_of_thought_2_fundamentals="FAILED",
+            chain_of_thought_3_risk="FAILED",
+            proposed_action="ERROR",
+            proposed_entry=tech.get('latest_price', 0.0),
+            proposed_stop_loss=0.0,
+            proposed_take_profit=0.0,
+            risk_percentage=0.0,
+            expected_holding_days=0,
+            final_rationale="Reasoning Engine Failure: AI returned no decision."
         )
 
     # 3. PYTHON HARD GUARDRAILS (Protecting Real Money)

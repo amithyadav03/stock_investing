@@ -5,7 +5,7 @@ import uvicorn
 from db.schema import init_db, SessionLocal, TradeProposal
 from agents.workflow import trading_agent_app
 from agents.state import AgentState
-from core.telegram_bot import send_telegram_trade_proposal
+from core.telegram_bot import send_telegram_trade_proposal, notify_error
 from core.validator import pre_execution_validation
 from core.config import settings
 from kiteconnect import KiteConnect
@@ -59,10 +59,12 @@ def run_agent_workflow(symbol: str):
     session.add(proposal)
     session.commit()
     session.refresh(proposal)
-    print(f"\n[ORCHESTRATOR] Analysis Complete: {symbol}. Agent decided to {decision.proposed_action}.")
-    
-    # Send for human approval if it's a BUY or SELL
-    if proposal.direction in ["BUY", "SELL"]:
+
+    if decision.proposed_action == "ERROR":
+        print(f"[ORCHESTRATOR] Reasoning Error for {symbol}: {decision.final_rationale}")
+        notify_error(symbol, decision.final_rationale)
+    elif proposal.direction in ["BUY", "SELL"]:
+        print(f"\n[ORCHESTRATOR] Analysis Complete: {symbol}. Agent decided to {decision.proposed_action}.")
         send_telegram_trade_proposal(
             proposal_id=proposal.id,
             symbol=proposal.symbol,
