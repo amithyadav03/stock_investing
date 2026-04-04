@@ -205,3 +205,20 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# --- PROJECT SPECIFIC IGNORES ---
+# Trading Database & State
+db/*.db
+db/*.db-journal
+db/charts/
+db/backtest_charts/
+db/chroma_memory/
+
+# Strategy Outputs & Analysis
+*.csv
+*.png
+*.jpg
+*.jpeg
+
+# Test artifacts
+tests/__pycache__/

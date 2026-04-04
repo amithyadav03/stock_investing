@@ -1,0 +1,55 @@
+# ==============================================================================
+# AI SWING TRADING AGENT - STRATEGY CONFIGURATION
+# ==============================================================================
+# Manage your stock lists, risk parameters, and order settings here.
+# Changes take effect on the next scan/execution.
+# ==============================================================================
+
+scanning:
+  # The list of NSE symbols to monitor in the daily or periodic scan.
+  symbols:
+    - RELIANCE
+    - ZOMATO
+    - IREDA
+    - TATASTEEL
+    - SUZLON
+    - HDFCBANK
+    - INFY
+    - PAYTM
+    - TRENT
+    - VEDL
+
+  # Delay between dispatching each agent to avoid Kite API rate limits.
+  interval_seconds: 2
+
+trading:
+  # Number of shares to buy/sell for testing. 
+  # In full production, this should be calculated based on equity/risk.
+  default_quantity: 1
+
+  # Order Variety: 'AMO' (After Market Order) or 'regular' (Live Market)
+  order_variety: AMO
+
+  # Product Type: 'CNC' (Cash and Carry), 'MIS' (Intraday), 'NRML' (Positional F&O)
+  product_type: CNC
+
+risk:
+  # Default risk as a percentage of capital (0.05 = 5%).
+  max_risk_per_trade: 0.05
+
+  # Stop Loss Width: current_price - (atr_sl_multiplier * ATR).
+  atr_sl_multiplier: 2.0
+
+  # Absolute guardrail: Reject any trade proposing a risk > 8% of equity.
+  max_absolute_risk_limit: 0.08
+
+  # Minimum SL Width: Reject if SL is closer than 0.5x ATR (too tight/noisy).
+  min_sl_atr_multiplier: 0.5
+
+news:
+  # Top tier Indian financial RSS feeds monitored for macro/micro sentiment.
+  rss_feeds:
+    - "https://www.moneycontrol.com/rss/MCtopnews.xml"
+    - "https://www.moneycontrol.com/rss/business.xml"
+    - "https://economictimes.indiatimes.com/markets/rssfeeds/2146842.cms"
+    - "https://www.livemint.com/rss/markets"
