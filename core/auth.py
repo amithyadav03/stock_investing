@@ -33,10 +33,15 @@ if __name__ == "__main__":
     if not settings.KITE_API_KEY:
         print("Please enter your KITE_API_KEY and SECRET in the .env file first.")
     else:
-        # Example Usage:
-        # 1. First run this script with print_login_url() uncommented:
         print_login_url()
         
-        # 2. Then paste your token below and run the script again with this uncommented:
-        # my_request_token = "PASTE_YOUR_REQUEST_TOKEN_HERE"
-        # generate_access_token(my_request_token)
+        # Make the script interactive
+        req_token = input("\nPaste the request_token from the URL bar here and press Enter: ").strip()
+        
+        if req_token:
+            try:
+                generate_access_token(req_token)
+            except Exception as e:
+                print(f"Failed to generate access token. Error: {e}")
+        else:
+            print("No token provided. Exiting.")

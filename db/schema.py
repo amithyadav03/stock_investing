@@ -24,6 +24,11 @@ class TradeProposal(Base):
     stop_loss = Column(Float)
     take_profit = Column(Float)
     
+    # Portfolio Sizing
+    quantity = Column(Integer, default=1)
+    risk_percentage = Column(Float, default=0.0)
+    conviction_tier = Column(String, default="LOW")
+    
     # Rationale and validation
     rationale = Column(String)         # The markdown string sent to telegram
     status = Column(String, default="PENDING") # PENDING, APPROVED, REJECTED, EXECUTED, ABORTED

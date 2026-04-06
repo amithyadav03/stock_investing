@@ -16,6 +16,15 @@ if __name__ == "__main__":
         exit(1)
 
     ngrok.set_auth_token(settings.NGROK_AUTH_TOKEN)
+    
+    # Kill any existing tunnels to avoid ERR_NGROK_334 on restarts
+    try:
+        for t in ngrok.get_tunnels():
+            ngrok.disconnect(t.public_url)
+            print(f"   Disconnected stale tunnel: {t.public_url}")
+    except Exception:
+        pass  # No existing tunnels, carry on
+    
     tunnel = ngrok.connect(8000)
     public_url = tunnel.public_url
     webhook_url = f"{public_url}/telegram-webhook"

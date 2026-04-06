@@ -22,10 +22,14 @@ scanning:
   # Delay between dispatching each agent to avoid Kite API rate limits.
   interval_seconds: 2
 
+  # Historical lookback (days) for structural S/R and Weekly Analysis.
+  # Institutional standard is 2+ years (approx 700 days).
+  lookback_days: 700
+
 trading:
-  # Number of shares to buy/sell for testing. 
-  # In full production, this should be calculated based on equity/risk.
-  default_quantity: 1
+  # The total amount of money in the portfolio allocated to this strategy.
+  # This value dictates the dynamic quantity sizing (e.g., 10,00,000 INR).
+  portfolio_capital: 1000000
 
   # Order Variety: 'AMO' (After Market Order) or 'regular' (Live Market)
   order_variety: AMO
@@ -34,8 +38,16 @@ trading:
   product_type: CNC
 
 risk:
-  # Default risk as a percentage of capital (0.05 = 5%).
-  max_risk_per_trade: 0.05
+  # Conviction Tiers Base Risk: This replaces the flat 5% risk.
+  # If Conviction is HIGH, risk 1.5%. MEDIUM = 1.0%. LOW = 0.5%.
+  risk_per_tier:
+    HIGH: 0.015
+    MEDIUM: 0.010
+    LOW: 0.005
+
+  # Liquidity Constraint: The calculated share quantity can NEVER exceed this 
+  # percentage of the stock's 30-day average daily volume. Prevents getting stuck.
+  max_liquidity_percent_of_volume: 0.01
 
   # Stop Loss Width: current_price - (atr_sl_multiplier * ATR).
   atr_sl_multiplier: 2.0

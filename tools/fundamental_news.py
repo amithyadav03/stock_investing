@@ -103,19 +103,26 @@ class FundamentalNewsTool:
             "summary": f"Found {len(news)} live articles.\nSample: {news[0]}"
         }
         
-    def get_macro_context(self) -> MacroContext:
+    def get_macro_context(self) -> Dict[str, Any]:
         """
-        Fetches the broader market headlines to establish Macro Environment.
+        Fetches the broader market headlines and global index performance (Nifty 50, S&P 500)
+        to establish the Macro Environment evidence.
         """
         macro_news = self.fetch_live_news_snippets(target_keyword=None)
         
-        # In full production, this string hits GPT-4o-mini daily at 8AM to populate the Enums.
-        # We simulate the parsed output here based on the live RSS flow.
-        
-        return MacroContext(
-            sentiment_enum="NEUTRAL",
-            risk_multiplier=1.0, 
-            summary=f"Parsed {len(macro_news)} top Indian headlines. Market appears stable."
-        )
+        # Global Index Trends (30 Days)
+        index_data = {}
+        for name, ticker in [("Nifty 50", "^NSEI"), ("S&P 500", "^GSPC")]:
+            try:
+                df = yf.Ticker(ticker).history(period="30d")
+                perf = (df['Close'].iloc[-1] - df['Close'].iloc[0]) / df['Close'].iloc[0]
+                index_data[name] = f"{'+' if perf > 0 else ''}{round(perf*100, 2)}%"
+            except:
+                index_data[name] = "Data Unavailable"
+
+        return {
+            "headlines": macro_news,
+            "index_performance": index_data
+        }
 
 fundamental_news_tool = FundamentalNewsTool()

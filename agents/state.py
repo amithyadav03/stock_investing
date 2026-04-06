@@ -12,6 +12,9 @@ class RiskDecision(BaseModel):
     proposed_entry: float = Field(description="The exact numerical entry price.")
     proposed_stop_loss: float = Field(description="The exact stop loss price. Should use ATR logic.")
     proposed_take_profit: float = Field(description="The exact take profit price.")
+    conviction_tier: str = Field(description="Strictly output exactly one of: 'HIGH', 'MEDIUM', or 'LOW'.")
+    win_probability_score: int = Field(description="Integer from 1 to 100 representing confidence in the setup structure.")
+
     risk_percentage: float = Field(description="Max risk as a float (e.g. 0.05 for 5%)")
     expected_holding_days: int = Field(description="Estimated number of calendar days to hold the position until the take profit is reached. e.g. 7, 14, 30.")
     final_rationale: str = Field(description="Markdown rationale of why this trade was proposed combining your Chain of Thought.")
