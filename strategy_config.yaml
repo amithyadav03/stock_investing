@@ -1,65 +1,82 @@
 # ==============================================================================
-# AI SWING TRADING AGENT - STRATEGY CONFIGURATION
-# ==============================================================================
-# Manage your stock lists, risk parameters, and order settings here.
-# Changes take effect on the next scan/execution.
+# AI SWING TRADING AGENT — STRATEGY CONFIGURATION
+# All parameters read at runtime — no code changes needed to adjust strategy.
 # ==============================================================================
 
 scanning:
-  # The list of NSE symbols to monitor in the daily or periodic scan.
-  symbols:
-    - RELIANCE
-    - ZOMATO
-    - IREDA
-    - TATASTEEL
-    - SUZLON
-    - HDFCBANK
-    - INFY
-    - PAYTM
-    - TRENT
-    - VEDL
-
-  # Delay between dispatching each agent to avoid Kite API rate limits.
+  # Daily scan interval between symbols (seconds) — avoids Kite rate limits
   interval_seconds: 2
 
-  # Historical lookback (days) for structural S/R and Weekly Analysis.
-  # Institutional standard is 2+ years (approx 700 days).
+  # Historical lookback for structural S/R and indicator calculations (days)
+  # Institutional standard: 2+ years ≈ 700 days
   lookback_days: 700
 
+  # Fallback symbols if pre-screener produces no candidates
+  symbols:
+    - RELIANCE
+    - HDFCBANK
+    - INFY
+    - TCS
+    - ICICIBANK
+    - TATAMOTORS
+    - BAJFINANCE
+
 trading:
-  # The total amount of money in the portfolio allocated to this strategy.
-  # This value dictates the dynamic quantity sizing (e.g., 10,00,000 INR).
+  # Total allocated capital for this strategy (INR)
   portfolio_capital: 1000000
 
-  # Order Variety: 'AMO' (After Market Order) or 'regular' (Live Market)
+  # Order placement:
+  #   AMO    = After-Market Order (placed pre/post market, fills at next open)
+  #   regular = Live market order
   order_variety: AMO
 
-  # Product Type: 'CNC' (Cash and Carry), 'MIS' (Intraday), 'NRML' (Positional F&O)
+  # Kite product type:
+  #   CNC  = Cash and Carry (delivery — for equity swing trades)
+  #   MIS  = Intraday
+  #   NRML = Positional F&O
   product_type: CNC
 
 risk:
-  # Conviction Tiers Base Risk: This replaces the flat 5% risk.
-  # If Conviction is HIGH, risk 1.5%. MEDIUM = 1.0%. LOW = 0.5%.
+  # Conviction-tiered position sizing (% of portfolio capital risked per trade)
   risk_per_tier:
-    HIGH: 0.015
-    MEDIUM: 0.010
-    LOW: 0.005
+    HIGH:   0.015   # 1.5% of ₹10L = ₹15,000 risk per trade
+    MEDIUM: 0.010   # 1.0% = ₹10,000
+    LOW:    0.005   # 0.5% = ₹5,000
 
-  # Liquidity Constraint: The calculated share quantity can NEVER exceed this 
-  # percentage of the stock's 30-day average daily volume. Prevents getting stuck.
+  # Liquidity constraint: quantity can never exceed X% of 30-day avg daily volume
   max_liquidity_percent_of_volume: 0.01
 
-  # Stop Loss Width: current_price - (atr_sl_multiplier * ATR).
+  # Stop loss placement: entry - (multiplier × ATR14)
   atr_sl_multiplier: 2.0
 
-  # Absolute guardrail: Reject any trade proposing a risk > 8% of equity.
-  max_absolute_risk_limit: 0.08
-
-  # Minimum SL Width: Reject if SL is closer than 0.5x ATR (too tight/noisy).
+  # Reject trade if proposed SL is tighter than this (too noisy)
   min_sl_atr_multiplier: 0.5
 
+  # Hard cap: no single trade can risk more than 8% of capital
+  max_absolute_risk_limit: 0.08
+
+  # Minimum Risk:Reward ratio — trades below 1.5 are rejected
+  min_rr_ratio: 1.5
+
+  # Circuit breaker thresholds
+  max_daily_loss_pct: 0.03        # 3% daily portfolio loss triggers halt
+  max_consecutive_losses: 3       # 3 losses in a row triggers halt
+  max_open_positions: 5           # No new entries beyond this count
+
+exit:
+  # How often to evaluate open positions (minutes) — used by monitor_positions.py
+  monitor_interval_minutes: 30
+
+  # Auto-exit if position hasn't hit TP within this many days
+  max_holding_days: 30
+
+  # Trail stop loss when price moves this many ATRs in our favour
+  trail_sl_atr_trigger: 1.0
+
+  # Exit if position moves this far against us (beyond ATR-based SL)
+  emergency_exit_atr_multiplier: 3.0
+
 news:
-  # Top tier Indian financial RSS feeds monitored for macro/micro sentiment.
   rss_feeds:
     - "https://www.moneycontrol.com/rss/MCtopnews.xml"
     - "https://www.moneycontrol.com/rss/business.xml"

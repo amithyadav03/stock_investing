@@ -1,205 +1,208 @@
 """
-🚀 ULTIMATE END-TO-END BACKTEST ENGINE (v3.0)
-==============================================
-1. Discovers candidates from NIFTY 100 (Simulated Pre-Scanner).
-2. Analyzes candidates via AI CMT Analyst (Institutional Logic).
-3. Evaluates long-term performance (30, 90, 180, 360 days).
+End-to-End Backtest Engine v4.0
+================================
+1. Simulates the Nifty 500 pre-screener on historical Nifty 100 data (liquid, yfinance-covered).
+2. Runs Claude AI analysis (claude-sonnet-4-6) on historical chart snapshots.
+3. Evaluates outcomes: SL hit, TP hit, or time-based exit.
+4. Reports: win rate, avg P&L, profit factor per conviction tier.
 
-Run with: python backtest.py
+Run: python backtest.py
 """
 
 import os
+import sys
 import base64
-import json
 import pandas as pd
-import pandas_ta as ta
 import matplotlib
 matplotlib.use('Agg')
 import mplfinance as mpf
 import yfinance as yf
 from datetime import datetime, timedelta
-from typing import Dict, Any, List
-from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage
+from typing import Dict, Any, List, Optional
+
 from agents.state import RiskDecision
 from core.config import settings
+from core.claude_client import get_client, call_structured, call_text
+from data.nifty500_symbols import NIFTY_100
+from tools.indicators import add_all_indicators, ema as calc_ema
 
-# ─── CONFIG ───────────────────────────────────────────────────────────────────
-# We simulate the Pre-Screener on this universe to find the daily candidates
-UNIVERSE_NIFTY_100 = [
-    "ABB", "ADANIENSOL", "ADANIENT", "ADANIGREEN", "ADANIPORTS", "ADANIPOWER", "ATGL", "AMBUJACEM", "APOLLOHOSP", "ASIANPAINT",
-    "DMART", "AXISBANK", "BAJAJ-AUTO", "BAJFINANCE", "BAJAJFINSV", "BAJAJHLDNG", "BANKBARODA", "BEL", "BPCL", "BHARTIARTL",
-    "BIOCON", "BOSCHLTD", "BRITANNIA", "CANBK", "CHOLAFIN", "CIPLA", "COALINDIA", "COFORGE", "COLPAL", "DLF",
-    "EICHERMOT", "GAIL", "GICRE", "GODREJCP", "GRASIM", "HCLTECH", "HDFCBANK", "HDFCLIFE", "HEROMOTOCO", "HINDALCO",
-    "HAL", "HINDUNILVR", "ICICIBANK", "ICICIGI", "ICICIPRULI", "ITC", "IOC", "IRCTC", "IRFC", "INDUSINDBK",
-    "INFY", "JSWSTEEL", "JINDALSTEL", "JIOFIN", "KOTAKBANK", "LTIM", "LT", "LICI", "M&M", "MARICO",
-    "MARUTI", "NTPC", "NESTLEIND", "ONGC", "PIDILITIND", "PFC", "POWERGRID", "PNB", "RELIANCE", "SBICARD",
-    "SBILIFE", "SRF", "SHREECEM", "SHRIRAMFIN", "SIEMENS", "SBIN", "SUNPHARMA", "TATACOMM", "TATAELXSI", "TATACONSUM",
-    "TATAMOTORS", "TATAPOWER", "TATASTEEL", "TCS", "TECHM", "TITAN", "TRENT", "TVSMOTOR", "UNITDSPR", "VBL",
-    "VEDL", "WIPRO", "ZOMATO", "ZYDUSLIFE"
-]
-
-WINDOWS = [30, 90, 180, 360]
 CHARTS_DIR = "./db/backtest_charts"
-LOOKBACK_HISTORY = 700 
-TOP_N_CANDIDATES = 5 # How many discovered stocks to analyze per window
+LOOKBACK_HISTORY = 700
+TOP_N_CANDIDATES = 5
+WINDOWS = [30, 90, 180, 360]
 
 os.makedirs(CHARTS_DIR, exist_ok=True)
 
-# ─── ENGINE CORE ──────────────────────────────────────────────────────────────
 
-def get_llm():
-    if settings.OPENAI_API_KEY:
-        return ChatOpenAI(model="gpt-4o", temperature=0, api_key=settings.OPENAI_API_KEY)
-    return None
-
-def encode_image(path: str) -> str:
-    if not os.path.exists(path): return ""
+def encode_image(path: str) -> Optional[str]:
+    if not path or not os.path.exists(path):
+        return None
     with open(path, "rb") as f:
         return base64.b64encode(f.read()).decode("utf-8")
+
 
 def load_prompt(filename: str) -> tuple[str, str]:
     path = os.path.join(os.path.dirname(__file__), "prompts", filename)
     with open(path, "r", encoding="utf-8") as f:
         content = f.read()
-    parts = content.split("---")
-    return parts[0].strip(), parts[1].strip()
+    parts = content.split("---", 1)
+    return parts[0].strip(), parts[1].strip() if len(parts) > 1 else ("", parts[0].strip())
 
-# ─── DISCOVERY (SIMULATED PRE-SCANNER) ────────────────────────────────────────
+
+# ── Discovery (Simulated Pre-Screener) ──────────────────────────────────────────
 
 def simulate_pre_scanner(cutoff_date: datetime) -> List[str]:
     """
-    Simulates the ELITE v4.0 Discovery Logic:
-    1. Volume > 500k
-    2. Green Candle
-    3. Price > 20-EMA (Trend Confirmation)
-    4. Relative Volume > 1.2 (Volume Surge)
+    Simulates the 3-stage discovery logic on historical Nifty 100 data.
+    Filters: Volume>500k, green candle, 0.5–10% change, price > EMA20, RV > 1.2.
     """
-    print(f"  [Scanner] Discovering Elite Candidates from Nifty 100 for {cutoff_date.strftime('%Y-%m-%d')}...")
+    print(f"  [Scanner] Discovering candidates from Nifty 100 @ {cutoff_date.strftime('%Y-%m-%d')}...")
+    start = cutoff_date - timedelta(days=60)
     candidates = []
-    
-    # We fetch a 50-day window before cutoff to calculate EMA and Relative Volume
-    start_search = cutoff_date - timedelta(days=60)
-    
-    for symbol in UNIVERSE_NIFTY_100:
+
+    for symbol in NIFTY_100:
         try:
-            df = yf.Ticker(f"{symbol}.NS").history(start=start_search.strftime("%Y-%m-%d"), end=(cutoff_date + timedelta(days=1)).strftime("%Y-%m-%d"))
-            if df.empty or len(df) < 25: continue
-            
-            # Historical context as of cutoff
-            df = df[df.index <= cutoff_date.strftime("%Y-%m-%d")]
-            if len(df) < 21: continue
-            
-            signal_day = df.iloc[-1]
-            prev_day = df.iloc[-2]
-            
-            # 1. Bhavcopy Heuristics
-            pct_change = ((signal_day['Close'] - prev_day['Close']) / prev_day['Close']) * 100
-            volume = signal_day['Volume']
-            is_green = signal_day['Close'] > signal_day['Open']
-            
-            # 2. Multi-Factor (RV & EMA)
-            df.ta.ema(length=20, append=True)
-            ema_20 = df['EMA_20'].iloc[-1]
-            avg_vol_20 = df['Volume'].iloc[-21:-1].mean()
-            rel_vol = volume / avg_vol_20 if avg_vol_20 > 0 else 0
-            
-            # FILTERS: Vol > 500k, Green, 0.5% < Change < 8%, Price > 20-EMA, RV > 1.2
-            if (volume > 500000 and is_green and 0.5 < pct_change < 10.0 and signal_day['Close'] > ema_20 and rel_vol > 1.2):
-                candidates.append({
-                    "symbol": symbol,
-                    "pct_change": pct_change,
-                    "rel_vol": rel_vol
-                })
-        except: continue
+            df = yf.Ticker(f"{symbol}.NS").history(
+                start=start.strftime("%Y-%m-%d"),
+                end=(cutoff_date + timedelta(days=1)).strftime("%Y-%m-%d"),
+            )
+            if df.empty or len(df) < 25:
+                continue
+            df = df[df.index <= pd.Timestamp(cutoff_date)]
+            if len(df) < 21:
+                continue
 
-    # Rank by Relative Volume (Institutional Footprint)
-    sorted_candidates = sorted(candidates, key=lambda x: x['rel_vol'], reverse=True)
-    discovery = [c['symbol'] for c in sorted_candidates[:TOP_N_CANDIDATES]]
-    print(f"  [Scanner] Found {len(discovery)} Elite v4.0 Candidates: {discovery}")
-    return discovery
+            signal = df.iloc[-1]
+            prev = df.iloc[-2]
+            pct = ((signal['Close'] - prev['Close']) / prev['Close']) * 100
+            volume = signal['Volume']
+            is_green = signal['Close'] > signal['Open']
 
-# ─── ANALYSIS (CMT AGENT) ─────────────────────────────────────────────────────
+            df['EMA_20'] = calc_ema(df, 20)
+            ema20 = float(df['EMA_20'].iloc[-1]) if not pd.isna(df['EMA_20'].iloc[-1]) else None
+            avg_vol = df['Volume'].iloc[-21:-1].mean()
+            rv = volume / avg_vol if avg_vol > 0 else 0
+
+            if (volume > 500_000 and is_green and 0.5 < pct < 10.0
+                    and ema20 and signal['Close'] > ema20 and rv > 1.2):
+                candidates.append({"symbol": symbol, "rv": rv, "pct": pct})
+        except Exception:
+            continue
+
+    candidates.sort(key=lambda x: x['rv'], reverse=True)
+    result = [c['symbol'] for c in candidates[:TOP_N_CANDIDATES]]
+    print(f"  [Scanner] Found {len(result)} elite candidates: {result}")
+    return result
+
+
+# ── Structural Snapshot ──────────────────────────────────────────────────────────
 
 def analyze_structural_snapshot(symbol: str, cutoff_date: datetime) -> Dict[str, Any]:
-    """Mirror production MarketDataTool structural analysis."""
-    start_history = cutoff_date - timedelta(days=LOOKBACK_HISTORY)
-    df = yf.Ticker(f"{symbol}.NS").history(start=start_history.strftime("%Y-%m-%d"), end=(cutoff_date + timedelta(days=1)).strftime("%Y-%m-%d"))
-    
-    if df.empty or len(df) < 50: return {}
-    
-    # Trim to exactly cutoff
-    df = df[df.index <= cutoff_date.strftime("%Y-%m-%d")]
-    if df.empty: return {}
+    """Mirrors production MarketDataTool analysis as of cutoff_date."""
+    start = cutoff_date - timedelta(days=LOOKBACK_HISTORY)
+    df = yf.Ticker(f"{symbol}.NS").history(
+        start=start.strftime("%Y-%m-%d"),
+        end=(cutoff_date + timedelta(days=1)).strftime("%Y-%m-%d"),
+    )
+    if df.empty or len(df) < 50:
+        return {}
 
-    # INDICATORS
-    df.ta.atr(length=14, append=True)
-    df.ta.rsi(length=14, append=True)
-    df.ta.macd(fast=12, slow=26, signal=9, append=True)
+    df = df[df.index <= pd.Timestamp(cutoff_date)]
+    if df.empty:
+        return {}
 
-    # WEEKLY TREND
-    df_weekly = df.resample('W').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'})
-    df_weekly['sma20'] = df_weekly['Close'].rolling(window=20).mean()
-    weekly_trend = "UP" if df_weekly['Close'].iloc[-1] > df_weekly['sma20'].iloc[-1] else "DOWN"
+    # Indicators
+    df = add_all_indicators(df)
 
-    # SUPPORT / RESISTANCE
-    df['min_20'] = df['Low'].rolling(window=20, center=True).min()
-    df['max_20'] = df['High'].rolling(window=20, center=True).max()
-    potential_supp = df[df['Low'] == df['min_20']]['Low'].unique()
-    potential_res = df[df['High'] == df['max_20']]['High'].unique()
-    current_price = df['Close'].iloc[-1]
-    support_levels = sorted([round(x, 2) for x in potential_supp if 0.8 * current_price <= x < current_price], reverse=True)[:3]
-    resistance_levels = sorted([round(x, 2) for x in potential_res if current_price < x <= 1.2 * current_price])[:3]
+    # Weekly trend
+    df_w = df.resample('W').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'})
+    df_w['sma20'] = df_w['Close'].rolling(20).mean()
+    weekly_trend = "UP" if df_w['Close'].iloc[-1] > df_w['sma20'].iloc[-1] else "DOWN"
 
-    # RELATIVE STRENGTH (vs NIFTY)
+    # S/R
+    df['min_20'] = df['Low'].rolling(20, center=True).min()
+    df['max_20'] = df['High'].rolling(20, center=True).max()
+    price = df['Close'].iloc[-1]
+    supp = sorted([round(x, 2) for x in df[df['Low'] == df['min_20']]['Low'].unique()
+                   if 0.8 * price <= x < price], reverse=True)[:3]
+    res = sorted([round(x, 2) for x in df[df['High'] == df['max_20']]['High'].unique()
+                  if price < x <= 1.2 * price])[:3]
+
+    # RS vs NIFTY
     try:
-        nifty_df = yf.Ticker("^NSEI").history(start=(cutoff_date - timedelta(days=60)).strftime("%Y-%m-%d"), end=(cutoff_date + timedelta(days=1)).strftime("%Y-%m-%d"))
-        stock_perf = (df['Close'].iloc[-1] - df['Close'].iloc[-30]) / df['Close'].iloc[-30]
-        nifty_perf = (nifty_df['Close'].iloc[-1] - nifty_df['Close'].iloc[-30]) / nifty_df['Close'].iloc[-30]
-        rs_score = round(stock_perf - nifty_perf, 4)
-    except: rs_score = 0.0
+        nifty = yf.Ticker("^NSEI").history(
+            start=(cutoff_date - timedelta(days=60)).strftime("%Y-%m-%d"),
+            end=(cutoff_date + timedelta(days=1)).strftime("%Y-%m-%d"),
+        )
+        rs_score = round(
+            (df['Close'].iloc[-1] - df['Close'].iloc[-30]) / df['Close'].iloc[-30]
+            - (nifty['Close'].iloc[-1] - nifty['Close'].iloc[-30]) / nifty['Close'].iloc[-30],
+            4,
+        )
+    except Exception:
+        rs_score = 0.0
 
-    # SEQUENTIAL DATA TABLE (14 Days)
-    recent_df = df.tail(14)
+    # Candle table
+    recent = df.tail(14)
     candles_table = "| Day | Open | High | Low | Close | Vol |\n| :--- | :--- | :--- | :--- | :--- | :--- |\n"
-    for idx, row in recent_df.iterrows():
-        candles_table += f"| {idx.strftime('%Y-%m-%d')} | {round(row['Open'], 2)} | {round(row['High'], 2)} | {round(row['Low'], 2)} | {round(row['Close'], 2)} | {int(row['Volume'])} |\n"
+    for idx, row in recent.iterrows():
+        candles_table += f"| {idx.strftime('%Y-%m-%d')} | {round(row['Open'],2)} | {round(row['High'],2)} | {round(row['Low'],2)} | {round(row['Close'],2)} | {int(row['Volume'])} |\n"
 
-    # CHART
-    chart_path = os.path.abspath(f"{CHARTS_DIR}/{symbol}_{cutoff_date.strftime('%Y%m%d')}_chart.png")
-    plot_df = df.tail(90)
-    macd_col = [col for col in df.columns if col.startswith('MACD_')][0]
-    macds_col = [col for col in df.columns if col.startswith('MACDs_')][0]
-    apdict = [mpf.make_addplot(plot_df[macd_col], panel=1, color='fuchsia', ylabel='MACD'), mpf.make_addplot(plot_df[macds_col], panel=1, color='b')]
-    mpf.plot(plot_df, type='candle', volume=True, style='charles', title=f"{symbol} - T-{cutoff_date.strftime('%Y-%m-%d')}", addplot=apdict, savefig=dict(fname=chart_path, dpi=100, bbox_inches='tight'))
+    # Chart
+    chart_path = os.path.abspath(f"{CHARTS_DIR}/{symbol}_{cutoff_date.strftime('%Y%m%d')}.png")
+    try:
+        plot_df = df.tail(90)
+        macd_col = next((c for c in df.columns if c.startswith('MACD_12')), None)
+        macds_col = next((c for c in df.columns if c.startswith('MACDs_12')), None)
+        apdict = []
+        if macd_col and macds_col:
+            apdict = [
+                mpf.make_addplot(plot_df[macd_col], panel=1, color='fuchsia', ylabel='MACD'),
+                mpf.make_addplot(plot_df[macds_col], panel=1, color='b'),
+            ]
+        mpf.plot(plot_df, type='candle', volume=True, style='charles',
+                 title=f"{symbol} T-{cutoff_date.strftime('%Y-%m-%d')}",
+                 addplot=apdict,
+                 savefig=dict(fname=chart_path, dpi=100, bbox_inches='tight'))
+    except Exception as e:
+        print(f"  [Chart] Render failed for {symbol}: {e}")
+        chart_path = None
 
     latest = df.iloc[-1]
-    atr_col = [col for col in df.columns if col.startswith('ATRr_')][0]
-    rsi_col = [col for col in df.columns if col.startswith('RSI_')][0]
+
+    def _g(prefix, default=0.0):
+        col = next((c for c in df.columns if c.startswith(prefix)), None)
+        return round(float(latest[col]), 4) if col else default
 
     return {
         "symbol": symbol,
-        "cutoff_price": round(latest['Close'], 2),
+        "cutoff_price": round(float(price), 2),
         "weekly_trend": weekly_trend,
         "rs_score": rs_score,
-        "supp_levels": support_levels,
-        "res_levels": resistance_levels,
-        "atr": round(latest[atr_col], 2),
-        "rsi": round(latest[rsi_col], 2),
-        "macd_hist": round(latest[macd_col] - latest[macds_col], 2),
+        "supp_levels": supp,
+        "res_levels": res,
+        "atr": _g('ATRr_14'),
+        "rsi": _g('RSI_14'),
+        "macd_hist": _g('MACD_12') - _g('MACDs_12'),
+        "adx": _g('ADX_14'),
+        "ema_20": _g('EMA_20'),
+        "ema_50": _g('EMA_50'),
         "recent_candles_table": candles_table,
-        "chart_path": chart_path
+        "chart_path": chart_path,
     }
 
-def get_ai_decision(snapshot: dict, snapshot_date: str) -> RiskDecision | None:
-    llm = get_llm()
-    if not llm: return None
+
+# ── AI Decision ──────────────────────────────────────────────────────────────────
+
+def get_ai_decision(snapshot: dict, snapshot_date: str) -> Optional[RiskDecision]:
+    client = get_client()
+    if not client:
+        print("  [AI] No ANTHROPIC_API_KEY. Skipping AI analysis.")
+        return None
+
     try:
-        structured_llm = llm.with_structured_output(RiskDecision)
-        base64_image = encode_image(snapshot['chart_path'])
-        sys_template, user_template = load_prompt("backtester.txt")
-        
-        user_prompt = user_template.format(
+        sys_prompt, user_template = load_prompt("backtester.txt")
+        user_text = user_template.format(
             snapshot_date=snapshot_date,
             symbol=snapshot['symbol'],
             cutoff_price=snapshot['cutoff_price'],
@@ -210,133 +213,179 @@ def get_ai_decision(snapshot: dict, snapshot_date: str) -> RiskDecision | None:
             rsi=snapshot['rsi'],
             atr=snapshot['atr'],
             macd_hist=snapshot['macd_hist'],
-            recent_candles_table=snapshot['recent_candles_table']
+            adx=snapshot.get('adx', 'N/A'),
+            ema_20=snapshot.get('ema_20', 'N/A'),
+            recent_candles_table=snapshot['recent_candles_table'],
         )
-        
-        decision = structured_llm.invoke([
-            SystemMessage(content=sys_template),
-            HumanMessage(content=[
-                {"type": "text", "text": user_prompt},
-                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_image}"}}
-            ])
-        ])
-        return decision
+        image_b64 = encode_image(snapshot.get('chart_path'))
+
+        result = call_structured(
+            client=client,
+            system_prompt=sys_prompt,
+            user_text=user_text,
+            tool_name="submit_backtest_decision",
+            tool_description="Submit the historical trade decision for backtesting",
+            tool_schema={
+                "type": "object",
+                "properties": {
+                    "chain_of_thought_1_technicals": {"type": "string"},
+                    "chain_of_thought_2_fundamentals": {"type": "string"},
+                    "chain_of_thought_3_risk": {"type": "string"},
+                    "proposed_action": {"type": "string", "enum": ["BUY", "SELL", "HOLD"]},
+                    "proposed_entry": {"type": "number"},
+                    "proposed_stop_loss": {"type": "number"},
+                    "proposed_take_profit": {"type": "number"},
+                    "conviction_tier": {"type": "string", "enum": ["HIGH", "MEDIUM", "LOW"]},
+                    "win_probability_score": {"type": "integer", "minimum": 1, "maximum": 100},
+                    "risk_percentage": {"type": "number"},
+                    "expected_holding_days": {"type": "integer"},
+                    "final_rationale": {"type": "string"},
+                },
+                "required": [
+                    "chain_of_thought_1_technicals", "chain_of_thought_2_fundamentals",
+                    "chain_of_thought_3_risk", "proposed_action", "proposed_entry",
+                    "proposed_stop_loss", "proposed_take_profit", "conviction_tier",
+                    "win_probability_score", "risk_percentage", "expected_holding_days",
+                    "final_rationale",
+                ],
+            },
+            image_base64=image_b64,
+        )
+        if result:
+            return RiskDecision(**result)
     except Exception as e:
-        print(f"  [Error] LLM Exception for {snapshot['symbol']}: {e}")
-        return None
+        print(f"  [AI] Decision failed for {snapshot['symbol']}: {e}")
+    return None
+
+
+# ── Outcome Evaluation ─────────────────────────────────────────────────────────
 
 def evaluate_outcome(decision: RiskDecision, symbol: str, cutoff_date: datetime) -> dict:
-    if decision.proposed_action != "BUY": return {"result": "SKIPPED", "pnl": 0}
-    
-    # Exit criteria: SL, TP, or 30 days
-    now = datetime.now()
-    holding_days = decision.expected_holding_days if decision.expected_holding_days > 0 else 30
-    end_date = min(cutoff_date + timedelta(days=holding_days + 10), now)
-    
-    outcome_df = yf.Ticker(f"{symbol}.NS").history(start=cutoff_date.strftime("%Y-%m-%d"), end=end_date.strftime("%Y-%m-%d"))
-    if outcome_df.empty: return {"result": "NO_DATA", "pnl": 0}
-    
-    # We remove the first candle matching the entry to simulate 'entry at close or next open'
-    outcome_df = outcome_df[outcome_df.index > cutoff_date.strftime("%Y-%m-%d")]
-    if outcome_df.empty: return {"result": "NO_DATA", "pnl": 0}
+    if decision.proposed_action != "BUY":
+        return {"result": "SKIPPED", "pnl": 0.0, "days": 0}
+
+    holding_days = max(decision.expected_holding_days, 5)
+    end_date = min(cutoff_date + timedelta(days=holding_days + 10), datetime.now())
+
+    outcome_df = yf.Ticker(f"{symbol}.NS").history(
+        start=cutoff_date.strftime("%Y-%m-%d"), end=end_date.strftime("%Y-%m-%d"),
+    )
+    if outcome_df.empty:
+        return {"result": "NO_DATA", "pnl": 0.0, "days": 0}
+
+    outcome_df = outcome_df[outcome_df.index > pd.Timestamp(cutoff_date)]
+    if outcome_df.empty:
+        return {"result": "NO_DATA", "pnl": 0.0, "days": 0}
 
     entry = decision.proposed_entry
     sl = decision.proposed_stop_loss
     tp = decision.proposed_take_profit
-    
-    exit_price = outcome_df['Close'].iloc[-1]
-    hit_sl = False
-    hit_tp = False
-    
-    for idx, row in outcome_df.iterrows():
-        if row['Low'] <= sl:
-            hit_sl = True; exit_price = sl; break
-        if row['High'] >= tp:
-            hit_tp = True; exit_price = tp; break
-            
-    pnl = round(((exit_price - entry) / entry) * 100, 2)
-    return {"result": "HIT_TP" if hit_tp else ("HIT_SL" if hit_sl else "FORCE_EXIT"), "pnl": pnl}
+    exit_price = float(outcome_df['Close'].iloc[-1])
+    hit_sl, hit_tp = False, False
+    days_taken = len(outcome_df)
 
-# ─── RUNNER ───────────────────────────────────────────────────────────────────
+    for i, (_, row) in enumerate(outcome_df.iterrows()):
+        if row['Low'] <= sl:
+            hit_sl, exit_price, days_taken = True, sl, i + 1; break
+        if row['High'] >= tp:
+            hit_tp, exit_price, days_taken = True, tp, i + 1; break
+
+    pnl = round(((exit_price - entry) / entry) * 100, 2) if entry > 0 else 0.0
+    result = "HIT_TP" if hit_tp else ("HIT_SL" if hit_sl else "FORCE_EXIT")
+    return {"result": result, "pnl": pnl, "days": days_taken}
+
+
+# ── Main Runner ────────────────────────────────────────────────────────────────
 
 def is_trading_day(d: datetime) -> bool:
-    return d.weekday() < 5 # Basic Mon-Fri check
+    return d.weekday() < 5
+
 
 def run_performance_audit():
-    print("=" * 75)
-    print("🚀 END-TO-END DISCOVERY & ANALYSIS AUDIT (v3.0)")
-    print("=" * 75)
-    
-    summary_results = []
+    print("=" * 70)
+    print("END-TO-END BACKTEST v4.0 — Claude AI + Nifty 100 Universe")
+    print("=" * 70)
+
+    if not settings.ANTHROPIC_API_KEY:
+        print("WARNING: ANTHROPIC_API_KEY not set. AI decisions will be skipped.")
+
+    results = []
     for window in WINDOWS:
-        # Align cutoff_date to the nearest previous trading day
-        cutoff_date = datetime.now() - timedelta(days=window)
-        while not is_trading_day(cutoff_date):
-            cutoff_date -= timedelta(days=1)
-            
-        print(f"\n📅 TESTING HORIZON: T-{window} days (Simulated Date: {cutoff_date.strftime('%Y-%m-%d')})")
-        
-        # 1. DISCOVERY (Simulated Screener)
-        candidates = simulate_pre_scanner(cutoff_date)
-        
-        # 2. ANALYSIS
+        cutoff = datetime.now() - timedelta(days=window)
+        while not is_trading_day(cutoff):
+            cutoff -= timedelta(days=1)
+
+        print(f"\n📅 T-{window} ({cutoff.strftime('%Y-%m-%d')})")
+        candidates = simulate_pre_scanner(cutoff)
+
         for symbol in candidates:
-            print(f"  🧠 AI Analyzing {symbol}...", end="", flush=True)
-            snapshot = analyze_structural_snapshot(symbol, cutoff_date)
-            if not snapshot: print(" SKIP (No snapshot)"); continue
-            
-            decision = get_ai_decision(snapshot, cutoff_date.strftime('%Y-%m-%d'))
-            if not decision: print(" ERROR (No decision)"); continue
-            
-            # Map action properly
-            action = decision.proposed_action if decision.proposed_action else "HOLD"
-            
+            print(f"  Analyzing {symbol}...", end="", flush=True)
+            snapshot = analyze_structural_snapshot(symbol, cutoff)
+            if not snapshot:
+                print(" SKIP (no data)")
+                continue
+
+            decision = get_ai_decision(snapshot, cutoff.strftime('%Y-%m-%d'))
+            if not decision:
+                print(" SKIP (no AI decision)")
+                continue
+
+            action = decision.proposed_action
             if action == "BUY":
-                outcome = evaluate_outcome(decision, symbol, cutoff_date)
-                print(f" {outcome['result']} ({outcome['pnl']}%)")
-                summary_results.append({
+                outcome = evaluate_outcome(decision, symbol, cutoff)
+                print(f" {outcome['result']} ({outcome['pnl']:+.2f}%, {outcome['days']}d)")
+                results.append({
                     "horizon": window, "symbol": symbol, "action": "BUY",
-                    "result": outcome['result'], "pnl": outcome['pnl'], "conviction": decision.conviction_tier
+                    "conviction": decision.conviction_tier,
+                    "win_prob": decision.win_probability_score,
+                    "result": outcome['result'], "pnl": outcome['pnl'], "days": outcome['days'],
                 })
             else:
                 print(f" {action}")
-                summary_results.append({
+                results.append({
                     "horizon": window, "symbol": symbol, "action": action,
-                    "result": "N/A", "pnl": 0, "conviction": decision.conviction_tier
+                    "conviction": decision.conviction_tier,
+                    "win_prob": decision.win_probability_score,
+                    "result": "N/A", "pnl": 0.0, "days": 0,
                 })
 
-    # FINAL HARVEST
-    if not summary_results:
-        print("\n[Audit] No signals were generated across any horizons. Ending.")
+    if not results:
+        print("\nNo signals generated. Ending.")
         return
 
-    df = pd.DataFrame(summary_results)
-    df.to_csv("./db/end_to_end_backtest_report.csv", index=False)
-    
-    print("\n" + "=" * 75)
-    print("🏁 FINAL PIPELINE SUMMARY")
-    print("=" * 75)
-    
-    if "action" in df.columns:
-        buys = df[df['action'] == "BUY"]
-        if not buys.empty:
-            win_rate = (len(buys[buys['pnl'] > 0]) / len(buys)) * 100
-            avg_pnl = buys['pnl'].mean()
-            print(f"Total Candidate Screened: {len(WINDOWS) * len(UNIVERSE_NIFTY_100)}")
-            print(f"Total Actions Proposed  : {len(df)}")
-            print(f"Total BUY Signals       : {len(buys)}")
-            print(f"Aggregate Win Rate      : {win_rate:.1f}%")
-            print(f"Avg PnL per Trade       : {avg_pnl:.2f}%")
-            
-            winners_pnl = buys[buys['pnl'] > 0]['pnl'].sum()
-            losers_pnl = abs(buys[buys['pnl'] < 0]['pnl'].sum())
-            profit_factor = (winners_pnl / losers_pnl) if losers_pnl > 0 else float('inf')
-            print(f"Profit Factor           : {profit_factor:.2f}")
-        else:
-            print("No BUY signals were generated by the AI in this universe/window.")
-    
-    print("=" * 75)
-    print("✅ Full Pipeline Report: ./db/end_to_end_backtest_report.csv")
+    df = pd.DataFrame(results)
+    df.to_csv("./db/backtest_report.csv", index=False)
+
+    print("\n" + "=" * 70)
+    print("BACKTEST SUMMARY")
+    print("=" * 70)
+    buys = df[df['action'] == "BUY"]
+    if not buys.empty:
+        win_rate = len(buys[buys['pnl'] > 0]) / len(buys) * 100
+        avg_pnl = buys['pnl'].mean()
+        winners_sum = buys[buys['pnl'] > 0]['pnl'].sum()
+        losers_sum = abs(buys[buys['pnl'] < 0]['pnl'].sum())
+        pf = winners_sum / losers_sum if losers_sum > 0 else float('inf')
+
+        print(f"Universe screened       : Nifty 100 ({len(NIFTY_100)} stocks)")
+        print(f"Total BUY signals       : {len(buys)}")
+        print(f"Win Rate                : {win_rate:.1f}%")
+        print(f"Avg P&L per trade       : {avg_pnl:+.2f}%")
+        print(f"Profit Factor           : {pf:.2f}")
+        print(f"Avg Holding Days        : {buys['days'].mean():.1f}")
+
+        print("\nBy Conviction Tier:")
+        for tier in ["HIGH", "MEDIUM", "LOW"]:
+            t = buys[buys['conviction'] == tier]
+            if not t.empty:
+                wr = len(t[t['pnl'] > 0]) / len(t) * 100
+                print(f"  {tier:6s}: {len(t):3d} trades | WR={wr:.0f}% | Avg={t['pnl'].mean():+.2f}%")
+    else:
+        print("No BUY signals generated.")
+
+    print("=" * 70)
+    print(f"Report: ./db/backtest_report.csv")
+
 
 if __name__ == "__main__":
     run_performance_audit()
