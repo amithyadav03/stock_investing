@@ -31,6 +31,7 @@ from datetime import datetime
 
 app = FastAPI(title="AI Swing Trade Agent")
 init_db()
+settings.validate_critical_keys()
 
 
 class ScanRequest(BaseModel):
@@ -225,6 +226,13 @@ async def health():
 @app.post("/telegram-webhook")
 async def telegram_webhook(request: Request):
     """Handles Approve/Reject/Exit/TrailSL callbacks from Telegram inline buttons."""
+    # Validate Telegram webhook secret if configured
+    if settings.TELEGRAM_WEBHOOK_SECRET:
+        token = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if token != settings.TELEGRAM_WEBHOOK_SECRET:
+            from fastapi.responses import JSONResponse
+            return JSONResponse(status_code=403, content={"error": "Forbidden"})
+
     payload = await request.json()
 
     if "callback_query" not in payload:

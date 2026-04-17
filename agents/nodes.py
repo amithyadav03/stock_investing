@@ -8,6 +8,7 @@ import base64
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from agents.state import AgentState, RiskDecision
+from agents.llm_utils import classify_macro, load_prompt as _load_prompt
 from tools.market_data import market_data_tool
 from tools.fundamental_news import fundamental_news_tool, MacroContext
 from db.memory import retrieve_similar_experiences
@@ -29,13 +30,6 @@ except Exception as e:
     print(f"[Langfuse] Disabled: {e}")
 
 
-def _load_prompt(filename: str) -> tuple[str, str]:
-    """Loads a prompt file; splits into system / user parts at '---'."""
-    path = os.path.join(os.path.dirname(__file__), "..", "prompts", filename)
-    with open(path, "r", encoding="utf-8") as f:
-        content = f.read()
-    parts = content.split("---", 1)
-    return parts[0].strip(), parts[1].strip() if len(parts) > 1 else ("", parts[0].strip())
 
 
 def _encode_image(path: str) -> str | None:
@@ -87,38 +81,8 @@ def fundamental_analyst_node(state: AgentState) -> dict:
     macro_raw = fundamental_news_tool.get_macro_context()
     sector_perf = fundamental_news_tool.get_sector_performance()
 
-    # Macro regime classification via Claude structured output
-    macro: MacroContext = MacroContext(sentiment_enum="NEUTRAL", risk_multiplier=1.0, summary="Macro data unavailable.")
-    client = get_client()
-    if client:
-        try:
-            sys_prompt, user_template = _load_prompt("macro_analyst.txt")
-            user_text = user_template.format(
-                index_performance=macro_raw.get('index_performance', {}),
-                headlines="\n".join(macro_raw.get('headlines', [])),
-            )
-            result = call_structured(
-                client=client,
-                system_prompt=sys_prompt,
-                user_text=user_text,
-                tool_name="submit_macro_context",
-                tool_description="Submit the macro market regime classification",
-                tool_schema={
-                    "type": "object",
-                    "properties": {
-                        "sentiment_enum": {"type": "string", "enum": ["BULLISH", "NEUTRAL", "BEARISH"]},
-                        "risk_multiplier": {"type": "number", "description": "1.2 for BULLISH, 1.0 for NEUTRAL, 0.7 for BEARISH"},
-                        "summary": {"type": "string", "description": "One-sentence analytical summary of the current regime"},
-                    },
-                    "required": ["sentiment_enum", "risk_multiplier", "summary"],
-                },
-            )
-            if result:
-                macro = MacroContext(**result)
-                print(f"[Macro] Regime: {macro.sentiment_enum} (×{macro.risk_multiplier})")
-        except Exception as e:
-            print(f"[Macro] Classification failed: {e}")
-            macro = MacroContext(sentiment_enum="NEUTRAL", risk_multiplier=1.0, summary=f"MACRO FAILURE: {e}")
+    # Macro regime classification — shared utility (no code duplication)
+    macro: MacroContext = classify_macro(macro_raw)
 
     return {
         "fundamental_analysis": fundamentals,

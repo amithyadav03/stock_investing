@@ -4,8 +4,7 @@ Evaluates active positions to decide: HOLD, TRAIL_SL, or EXIT_NOW.
 Called periodically by scripts/monitor_positions.py during market hours.
 """
 
-import os
-from typing import TypedDict, Optional, List
+from typing import Optional
 from pydantic import BaseModel, Field
 from datetime import datetime
 
@@ -13,6 +12,7 @@ from tools.market_data import market_data_tool
 from tools.fundamental_news import fundamental_news_tool
 from core.claude_client import get_client, call_structured
 from core.config import settings
+from agents.llm_utils import classify_macro, load_prompt as _load_prompt
 
 
 class ExitDecision(BaseModel):
@@ -68,49 +68,16 @@ def evaluate_exit(
 
     # Macro context for exit decision
     macro_raw = fundamental_news_tool.get_macro_context()
-    macro_regime = "NEUTRAL"
-    macro_summary = ""
+    macro = classify_macro(macro_raw)
+    macro_regime = macro.sentiment_enum
+    macro_summary = macro.summary
     client = get_client()
-    if client:
-        try:
-            from core.claude_client import call_structured as cs
-            from prompts import _load_prompt  # not available — inline macro below
-        except Exception:
-            pass
-        try:
-            result = call_structured(
-                client=client,
-                system_prompt="You are a macro regime classifier. Classify market regime from index performance and headlines.",
-                user_text=f"Index performance: {macro_raw.get('index_performance')}\nHeadlines:\n" + "\n".join(macro_raw.get('headlines', [])[:5]),
-                tool_name="classify_macro",
-                tool_description="Classify the current macro regime",
-                tool_schema={
-                    "type": "object",
-                    "properties": {
-                        "regime": {"type": "string", "enum": ["BULLISH", "NEUTRAL", "BEARISH"]},
-                        "summary": {"type": "string"},
-                    },
-                    "required": ["regime", "summary"],
-                },
-                cache_system=True,
-            )
-            if result:
-                macro_regime = result.get("regime", "NEUTRAL")
-                macro_summary = result.get("summary", "")
-        except Exception as e:
-            print(f"[ExitMonitor] Macro classification failed: {e}")
 
     # AI exit analysis
     exit_decision = ExitDecision(action="HOLD", urgency="NORMAL", rationale="No AI analysis available.")
     if client:
         try:
-            prompt_path = os.path.join(os.path.dirname(__file__), "..", "prompts", "exit_analyst.txt")
-            with open(prompt_path, "r") as f:
-                content = f.read()
-            parts = content.split("---", 1)
-            sys_prompt = parts[0].strip()
-            user_template = parts[1].strip() if len(parts) > 1 else parts[0].strip()
-
+            sys_prompt, user_template = _load_prompt("exit_analyst.txt")
             user_text = user_template.format(
                 symbol=symbol,
                 direction=direction,

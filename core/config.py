@@ -1,4 +1,5 @@
 import os
+import functools
 from dotenv import load_dotenv
 load_dotenv()
 from pydantic_settings import BaseSettings
@@ -20,6 +21,10 @@ class Settings(BaseSettings):
     TELEGRAM_BOT_TOKEN: str = ""
     TELEGRAM_CHAT_ID: str = ""
 
+    # Telegram webhook secret — set this to any random string in .env
+    # and configure same value in Telegram setWebhook secret_token
+    TELEGRAM_WEBHOOK_SECRET: str = ""
+
     # Database
     DATABASE_URL: str = "sqlite:///./db/trading.db"
     CHROMA_DB_DIR: str = "./db/chroma_memory"
@@ -32,16 +37,34 @@ class Settings(BaseSettings):
     LANGFUSE_PUBLIC_KEY: str = ""
     LANGFUSE_HOST: str = ""
 
-    @property
+    @functools.cached_property
     def strategy(self):
+        """Loads strategy_config.yaml once and caches it for the process lifetime."""
         import yaml
         config_path = os.path.join(os.path.dirname(__file__), "..", "strategy_config.yaml")
         try:
             with open(config_path, "r") as f:
-                return yaml.safe_load(f)
+                data = yaml.safe_load(f)
+            print("[Config] strategy_config.yaml loaded.")
+            return data
         except Exception as e:
             print(f"[Config] Error loading strategy_config.yaml: {e}")
             return {}
+
+    def validate_critical_keys(self):
+        """Warn at startup about missing critical configuration."""
+        issues = []
+        if not self.ANTHROPIC_API_KEY:
+            issues.append("ANTHROPIC_API_KEY not set — AI analysis will be skipped.")
+        if not self.TELEGRAM_BOT_TOKEN:
+            issues.append("TELEGRAM_BOT_TOKEN not set — Telegram notifications disabled.")
+        if not self.KITE_API_KEY or not self.KITE_ACCESS_TOKEN:
+            issues.append("KITE_API_KEY/KITE_ACCESS_TOKEN not set — live orders disabled.")
+        if not self.TELEGRAM_WEBHOOK_SECRET:
+            issues.append("TELEGRAM_WEBHOOK_SECRET not set — webhook is unauthenticated (dev only).")
+        for issue in issues:
+            print(f"[Config] WARNING: {issue}")
+        return len(issues) == 0
 
     class Config:
         env_file = ".env"
