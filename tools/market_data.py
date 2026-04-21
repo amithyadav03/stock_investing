@@ -10,6 +10,7 @@ from kiteconnect import KiteConnect
 from datetime import datetime, timedelta
 from tenacity import retry, stop_after_attempt, wait_exponential
 from tools.indicators import add_all_indicators
+from core.cache import cache, TTL_TECHNICALS, TTL_PRICE
 
 
 class MarketDataTool:
@@ -187,17 +188,148 @@ class MarketDataTool:
         }
 
     def get_current_price(self, symbol: str) -> float:
+        cache_key = f"price_{symbol}"
+        cached = cache.get(cache_key)
+        if cached:
+            return cached
+        price = 0.0
         if self.kite:
             try:
                 quote = self.kite.quote(f"NSE:{symbol}")
-                return float(quote[f"NSE:{symbol}"]["last_price"])
+                price = float(quote[f"NSE:{symbol}"]["last_price"])
             except Exception:
                 pass
-        sym = f"{symbol}.NS"
-        df = yf.Ticker(sym).history(period="1d")
-        if not df.empty:
-            return round(float(df['Close'].iloc[-1]), 2)
-        return 0.0
+        if price <= 0:
+            sym = f"{symbol}.NS"
+            df = yf.Ticker(sym).history(period="1d")
+            if not df.empty:
+                price = round(float(df['Close'].iloc[-1]), 2)
+        if price > 0:
+            cache.set(cache_key, price, TTL_PRICE)
+        return price
+
+    def fetch_weekly_data(self, symbol: str) -> Dict[str, Any]:
+        """Weekly OHLCV with key indicators for positional/value strategy confirmation."""
+        cache_key = f"weekly_{symbol}"
+        cached = cache.get(cache_key)
+        if cached:
+            return cached
+
+        sym = f"{symbol}.NS" if not symbol.endswith(".NS") else symbol
+        try:
+            df = yf.Ticker(sym).history(period="2y", interval="1wk")
+        except Exception as e:
+            return {"error": str(e)}
+
+        if df.empty or len(df) < 20:
+            return {"error": f"Insufficient weekly data for {symbol}"}
+
+        df = df.dropna()
+        # EMA calculations on weekly
+        df['EMA_10w'] = df['Close'].ewm(span=10, adjust=False).mean()
+        df['EMA_30w'] = df['Close'].ewm(span=30, adjust=False).mean()
+
+        price = float(df['Close'].iloc[-1])
+        ema10 = float(df['EMA_10w'].iloc[-1])
+        ema30 = float(df['EMA_30w'].iloc[-1])
+
+        # Weekly RSI
+        delta = df['Close'].diff()
+        gain = delta.clip(lower=0).rolling(14).mean()
+        loss = (-delta.clip(upper=0)).rolling(14).mean()
+        rs = gain / (loss + 1e-10)
+        weekly_rsi = float(100 - 100 / (1 + rs.iloc[-1]))
+
+        # Trend: price above both EMAs on weekly = strong uptrend
+        weekly_structure = "STRONG_UP" if price > ema10 > ema30 else \
+                           "UP" if price > ema30 else \
+                           "DOWN" if price < ema30 else "SIDEWAYS"
+
+        # 52-week high/low
+        high_52w = float(df['High'].tail(52).max())
+        low_52w = float(df['Low'].tail(52).min())
+        pct_from_high = round((price - high_52w) / high_52w * 100, 2)
+
+        result = {
+            "symbol": symbol,
+            "weekly_price": round(price, 2),
+            "weekly_ema_10": round(ema10, 2),
+            "weekly_ema_30": round(ema30, 2),
+            "weekly_rsi": round(weekly_rsi, 1),
+            "weekly_structure": weekly_structure,
+            "high_52w": round(high_52w, 2),
+            "low_52w": round(low_52w, 2),
+            "pct_from_52w_high": pct_from_high,
+        }
+        cache.set(cache_key, result, TTL_TECHNICALS)
+        return result
+
+    def fetch_monthly_data(self, symbol: str) -> Dict[str, Any]:
+        """Monthly OHLCV for value and positional long-term trend assessment."""
+        cache_key = f"monthly_{symbol}"
+        cached = cache.get(cache_key)
+        if cached:
+            return cached
+
+        sym = f"{symbol}.NS" if not symbol.endswith(".NS") else symbol
+        try:
+            df = yf.Ticker(sym).history(period="5y", interval="1mo")
+        except Exception as e:
+            return {"error": str(e)}
+
+        if df.empty or len(df) < 12:
+            return {"error": f"Insufficient monthly data for {symbol}"}
+
+        df = df.dropna()
+        df['EMA_12m'] = df['Close'].ewm(span=12, adjust=False).mean()
+        df['EMA_24m'] = df['Close'].ewm(span=24, adjust=False).mean()
+
+        price = float(df['Close'].iloc[-1])
+        ema12 = float(df['EMA_12m'].iloc[-1])
+        ema24 = float(df['EMA_24m'].iloc[-1])
+
+        # Monthly momentum: 3-month and 12-month returns
+        ret_3m = round((price - float(df['Close'].iloc[-3])) / float(df['Close'].iloc[-3]) * 100, 2) if len(df) >= 3 else 0.0
+        ret_12m = round((price - float(df['Close'].iloc[-12])) / float(df['Close'].iloc[-12]) * 100, 2) if len(df) >= 12 else 0.0
+
+        monthly_trend = "UP" if price > ema12 > ema24 else "DOWN" if price < ema24 else "NEUTRAL"
+
+        result = {
+            "symbol": symbol,
+            "monthly_price": round(price, 2),
+            "monthly_ema_12": round(ema12, 2),
+            "monthly_ema_24": round(ema24, 2),
+            "monthly_trend": monthly_trend,
+            "return_3m_pct": ret_3m,
+            "return_12m_pct": ret_12m,
+        }
+        cache.set(cache_key, result, TTL_TECHNICALS)
+        return result
+
+    def get_multi_timeframe_context(self, symbol: str) -> Dict[str, Any]:
+        """Returns combined daily + weekly + monthly context for multi-timeframe analysis."""
+        daily = self.fetch_advanced_technicals(symbol)
+        weekly = self.fetch_weekly_data(symbol)
+        monthly = self.fetch_monthly_data(symbol)
+
+        # Confluence score: how many timeframes agree on direction
+        timeframe_signals = []
+        if daily.get("weekly_trend") == "UP":
+            timeframe_signals.append(1)
+        if weekly.get("weekly_structure") in ("UP", "STRONG_UP"):
+            timeframe_signals.append(1)
+        if monthly.get("monthly_trend") == "UP":
+            timeframe_signals.append(1)
+
+        confluence_score = len(timeframe_signals)  # 0-3: 3 = all timeframes aligned
+
+        return {
+            "daily": daily,
+            "weekly": weekly,
+            "monthly": monthly,
+            "timeframe_confluence": confluence_score,
+            "all_timeframes_aligned": confluence_score == 3,
+        }
 
 
 market_data_tool = MarketDataTool()

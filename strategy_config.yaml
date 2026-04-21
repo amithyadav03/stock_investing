@@ -1,18 +1,91 @@
 # ==============================================================================
-# AI SWING TRADING AGENT — STRATEGY CONFIGURATION
-# All parameters read at runtime — no code changes needed to adjust strategy.
+# ALPHA AGENT — STRATEGY CONFIGURATION
+# All parameters read at runtime — no code changes needed to tune strategy.
 # ==============================================================================
 
+# ── Capital ────────────────────────────────────────────────────────────────────
+capital:
+  paper_mode: true                      # true = simulation, false = live Kite orders
+  paper_capital: 500000                 # ₹5L virtual capital
+  live_capital: 500000                  # sync from Kite margins in live mode
+  max_concurrent_positions: 5           # total across all strategies
+  min_available_capital: 10000          # don't open new trade below this threshold
+
+# ── Scheduled Reports (IST, 24-hr) ────────────────────────────────────────────
+reports:
+  morning_brief: "08:30"
+  midday_checkin: "12:30"
+  eod_summary: "17:00"
+
+# ── Per-Strategy Configuration ────────────────────────────────────────────────
+strategies:
+
+  swing:
+    enabled: true
+    max_positions: 3                    # max simultaneous swing positions
+    holding_days_min: 5
+    holding_days_max: 30
+    conviction_threshold: 65            # min 0-100 score to generate a proposal
+    risk_per_trade: 0.01                # 1% of total capital per trade
+    atr_sl_multiplier: 2.0
+    min_rr_ratio: 1.5
+    timeframes: [daily, weekly]
+
+  positional:
+    enabled: true
+    max_positions: 2
+    holding_days_min: 30
+    holding_days_max: 180
+    conviction_threshold: 72            # higher bar — longer commitment
+    risk_per_trade: 0.01
+    atr_sl_multiplier: 2.5
+    min_rr_ratio: 2.0
+    timeframes: [daily, weekly, monthly]
+
+  value:
+    enabled: false                      # auto-enables when capital >= min_capital_to_activate
+    min_capital_to_activate: 200000     # ₹2L minimum
+    max_positions: 2
+    holding_days_min: 180
+    holding_days_max: 1095              # 3 years
+    conviction_threshold: 78
+    risk_per_trade: 0.015
+    atr_sl_multiplier: 3.0
+    min_rr_ratio: 3.0
+    timeframes: [weekly, monthly]
+
+# ── Risk Guardrails (all strategies) ──────────────────────────────────────────
+risk:
+  conviction_multipliers:
+    HIGH:   1.00
+    MEDIUM: 0.75
+    LOW:    0.50
+
+  max_absolute_risk_per_trade: 0.02     # never risk >2% on any single trade
+  max_portfolio_heat: 0.05              # total capital at risk across all open trades
+  max_position_size_pct: 0.20           # single position ≤ 20% of portfolio
+
+  max_liquidity_percent_of_volume: 0.01
+  min_sl_atr_multiplier: 0.5
+
+  max_daily_loss_pct: 0.03
+  max_consecutive_losses: 3
+  max_open_positions: 5
+
+# ── Exit Management ────────────────────────────────────────────────────────────
+exit:
+  monitor_interval_minutes: 10
+  max_holding_days_swing: 30
+  max_holding_days_positional: 180
+  trail_sl_atr_trigger: 1.0
+  emergency_exit_atr_multiplier: 3.0
+
+# ── Scanning ──────────────────────────────────────────────────────────────────
 scanning:
-  # Daily scan interval between symbols (seconds) — avoids Kite rate limits
   interval_seconds: 2
-
-  # Historical lookback for structural S/R and indicator calculations (days)
-  # Institutional standard: 2+ years ≈ 700 days
   lookback_days: 700
-
-  # Fallback symbols if pre-screener produces no candidates
-  symbols:
+  pre_screener_top_n: 20               # top N from screener sent to deep analysis
+  fallback_symbols:
     - RELIANCE
     - HDFCBANK
     - INFY
@@ -20,65 +93,33 @@ scanning:
     - ICICIBANK
     - TATAMOTORS
     - BAJFINANCE
+    - SUNPHARMA
+    - WIPRO
+    - HCLTECH
 
+# ── Order Execution ───────────────────────────────────────────────────────────
 trading:
-  # Total allocated capital for this strategy (INR)
-  portfolio_capital: 1000000
-
-  # Order placement:
-  #   AMO    = After-Market Order (placed pre/post market, fills at next open)
-  #   regular = Live market order
   order_variety: AMO
-
-  # Kite product type:
-  #   CNC  = Cash and Carry (delivery — for equity swing trades)
-  #   MIS  = Intraday
-  #   NRML = Positional F&O
   product_type: CNC
+  amo_cutoff_time: "09:00"             # IST — approve before this for same-day AMO
 
-risk:
-  # Conviction-tiered position sizing (% of portfolio capital risked per trade)
-  risk_per_tier:
-    HIGH:   0.015   # 1.5% of ₹10L = ₹15,000 risk per trade
-    MEDIUM: 0.010   # 1.0% = ₹10,000
-    LOW:    0.005   # 0.5% = ₹5,000
-
-  # Liquidity constraint: quantity can never exceed X% of 30-day avg daily volume
-  max_liquidity_percent_of_volume: 0.01
-
-  # Stop loss placement: entry - (multiplier × ATR14)
-  atr_sl_multiplier: 2.0
-
-  # Reject trade if proposed SL is tighter than this (too noisy)
-  min_sl_atr_multiplier: 0.5
-
-  # Hard cap: no single trade can risk more than 8% of capital
-  max_absolute_risk_limit: 0.08
-
-  # Minimum Risk:Reward ratio — trades below 1.5 are rejected
-  min_rr_ratio: 1.5
-
-  # Circuit breaker thresholds
-  max_daily_loss_pct: 0.03        # 3% daily portfolio loss triggers halt
-  max_consecutive_losses: 3       # 3 losses in a row triggers halt
-  max_open_positions: 5           # No new entries beyond this count
-
-exit:
-  # How often to evaluate open positions (minutes) — used by monitor_positions.py
-  monitor_interval_minutes: 30
-
-  # Auto-exit if position hasn't hit TP within this many days
-  max_holding_days: 30
-
-  # Trail stop loss when price moves this many ATRs in our favour
-  trail_sl_atr_trigger: 1.0
-
-  # Exit if position moves this far against us (beyond ATR-based SL)
-  emergency_exit_atr_multiplier: 3.0
-
+# ── News ──────────────────────────────────────────────────────────────────────
 news:
+  check_interval_minutes: 15
   rss_feeds:
     - "https://www.moneycontrol.com/rss/MCtopnews.xml"
     - "https://www.moneycontrol.com/rss/business.xml"
     - "https://economictimes.indiatimes.com/markets/rssfeeds/2146842.cms"
     - "https://www.livemint.com/rss/markets"
+    - "https://www.business-standard.com/rss/markets-106.rss"
+
+# ── Global Market Tickers (for morning brief) ─────────────────────────────────
+global_indices:
+  - {ticker: "^GSPC",    name: "S&P 500"}
+  - {ticker: "^IXIC",    name: "NASDAQ"}
+  - {ticker: "^N225",    name: "Nikkei 225"}
+  - {ticker: "^HSI",     name: "Hang Seng"}
+  - {ticker: "GC=F",     name: "Gold"}
+  - {ticker: "CL=F",     name: "Crude Oil"}
+  - {ticker: "USDINR=X", name: "USD/INR"}
+  - {ticker: "^VIX",     name: "VIX"}

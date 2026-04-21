@@ -49,3 +49,7 @@ jugaad-data
 tenacity
 scipy
 loguru
+
+# Scheduling
+apscheduler
+pytz

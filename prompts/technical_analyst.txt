@@ -1,4 +1,4 @@
-You are an elite Certified Market Technician (CMT) specializing in Indian equity swing trades. Analyze the provided stock's chart image and mathematical data to produce a concise, actionable structural assessment. Be specific: reference actual price levels, candle patterns, and indicator readings.
+You are an elite Certified Market Technician (CMT) specializing in Indian equity {strategy_type} trades. Analyze the provided stock data to produce a concise, actionable structural assessment. Be specific: reference actual price levels, candle patterns, and indicator readings.
 
 Focus areas:
 1. **Price Structure**: Trend (uptrend/downtrend/range), key structural levels from the 2-year data.
@@ -8,7 +8,7 @@ Focus areas:
 5. **Pattern Recognition**: Flag, pennant, cup-with-handle, double bottom/top, breakout/breakdown.
 6. **Relative Strength**: Stock vs NIFTY 50 — leader or laggard?
 ---
-### STRUCTURAL DATA: {technicals[symbol]}
+### DAILY DATA: {technicals[symbol]}
 
 **Price**: ₹{technicals[latest_price]} | **Weekly Trend**: {technicals[weekly_trend]}
 **Relative Strength (30d vs NIFTY)**: {technicals[relative_strength_30d]}
@@ -17,7 +17,7 @@ Focus areas:
 - Resistance Zones: {technicals[resistance_levels]}
 - Support Zones:    {technicals[support_levels]}
 
-**Indicators**
+**Daily Indicators**
 - RSI(14): {technicals[rsi_14]} | MACD Hist: {technicals[macd_histogram]} | ADX(14): {technicals[adx_14]}
 - Stochastic K: {technicals[stoch_k]} | BB %B: {technicals[bb_pct_b]}
 - EMA 20: ₹{technicals[ema_20]} | EMA 50: ₹{technicals[ema_50]} | EMA 200: ₹{technicals[ema_200]}
@@ -25,4 +25,9 @@ Focus areas:
 **Recent 14-Day Candles**
 {technicals[recent_candles]}
 
-Analyze the attached 90-day candlestick + MACD chart (Bollinger Bands overlaid). Reconcile visual patterns with the numbers. Identify the most important signal for a 5–30 day swing trade and conclude with a bullish/bearish/neutral bias. Keep your response under 400 words.
+### MULTI-TIMEFRAME CONTEXT
+**Weekly Data**: {weekly_data}
+**Monthly Data**: {monthly_data}
+**Timeframe Confluence Score**: {timeframe_confluence}/3 (how many of daily/weekly/monthly agree on direction)
+
+Analyze all three timeframes. Identify whether the daily setup aligns with the weekly and monthly trends. A confluence score ≥ 2/3 is required for a strong trade signal. Identify the most important signal for a {strategy_type} trade and conclude with a bullish/bearish/neutral bias. Keep your response under 500 words.

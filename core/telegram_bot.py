@@ -8,7 +8,7 @@ from core.config import settings
 
 def _send(payload: dict) -> bool:
     if not settings.TELEGRAM_BOT_TOKEN or not settings.TELEGRAM_CHAT_ID:
-        print(f"[Telegram MOCK] {payload.get('text', '')[:100]}")
+        print(f"[Telegram MOCK] {payload.get('text', '')[:120]}")
         return True
     url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
@@ -21,10 +21,20 @@ def _send(payload: dict) -> bool:
 
 
 def send_telegram_trade_proposal(
-    proposal_id: int, symbol: str, action: str, rationale: str,
-    entry: float, sl: float, tp: float, holding_days: int = 0,
-    conviction: str = "MEDIUM", win_prob: int = 0,
+    proposal_id: int,
+    symbol: str,
+    action: str,
+    rationale: str,
+    entry: float,
+    sl: float,
+    tp: float,
+    holding_days: int = 0,
+    conviction: str = "MEDIUM",
+    win_prob: int = 0,
     technical_narrative: str = "",
+    strategy_type: str = "swing",
+    conviction_score: int = 0,
+    research_summary: str = "",
 ) -> bool:
     rr_ratio = "N/A"
     if action == "BUY" and entry > 0 and sl > 0:
@@ -37,28 +47,35 @@ def send_telegram_trade_proposal(
         rr_ratio = f"1:{round(reward / risk, 1)}" if risk > 0 else "N/A"
 
     conviction_emoji = {"HIGH": "🔥", "MEDIUM": "⚡", "LOW": "⚠️"}.get(conviction.upper(), "📊")
+    strategy_emoji = {"swing": "🔄", "positional": "📐", "value": "💎"}.get(strategy_type, "📊")
+    mode_tag = "📄 PAPER" if settings.PAPER_MODE else "💰 LIVE"
 
     msg = (
-        f"🚨 *New AI Trade Proposal* 🚨\n\n"
+        f"🚨 *New Trade Proposal* {strategy_emoji} [{strategy_type.upper()}] {mode_tag}\n\n"
         f"*Symbol*: `{symbol}`\n"
         f"*Action*: `{action}`\n"
-        f"*Conviction*: {conviction_emoji} `{conviction}` ({win_prob}% probability)\n"
+        f"*Conviction*: {conviction_emoji} `{conviction}` | Score: `{conviction_score}/100` | Win prob: {win_prob}%\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"*Entry*:       ₹{entry}\n"
         f"*Stop Loss*:   ₹{sl}\n"
         f"*Take Profit*: ₹{tp}\n"
-        f"*Timeframe*:   ~{holding_days} days\n"
+        f"*Hold*:        ~{holding_days} days\n"
         f"*Risk/Reward*: {rr_ratio}\n"
         f"━━━━━━━━━━━━━━━━━━\n\n"
-        f"*AI Rationale*:\n{rationale[:600]}\n\n"
+        f"*Rationale*:\n{rationale[:500]}\n"
     )
+    if research_summary:
+        msg += f"\n*Research*:\n{research_summary[:250]}\n"
     if technical_narrative:
-        msg += f"*Chart Analysis*:\n{technical_narrative[:300]}\n"
+        msg += f"\n*Chart*: {technical_narrative[:200]}\n"
+
+    msg += "\n_Approve before 9:00 AM for AMO execution tomorrow._"
 
     reply_markup = {
         "inline_keyboard": [[
-            {"text": "✅ Approve & Execute", "callback_data": f"APPROVE_{proposal_id}"},
-            {"text": "❌ Reject",            "callback_data": f"REJECT_{proposal_id}"},
+            {"text": "✅ Approve AMO",   "callback_data": f"APPROVE_{proposal_id}"},
+            {"text": "❌ Reject",        "callback_data": f"REJECT_{proposal_id}"},
+            {"text": "🔍 Research",      "callback_data": f"RESEARCH_{proposal_id}"},
         ]]
     }
     return _send({
@@ -70,8 +87,14 @@ def send_telegram_trade_proposal(
 
 
 def send_exit_alert(
-    execution_id: int, symbol: str, action: str, current_price: float,
-    pnl_pct: float, rationale: str, new_sl: float = None, urgency: str = "NORMAL",
+    execution_id: int,
+    symbol: str,
+    action: str,
+    current_price: float,
+    pnl_pct: float,
+    rationale: str,
+    new_sl: float = None,
+    urgency: str = "NORMAL",
 ) -> bool:
     urgency_prefix = "🚨 *URGENT* " if urgency == "URGENT" else "📊 "
     action_emoji = {"EXIT_NOW": "🔴", "TRAIL_SL": "🔵", "HOLD": "🟢"}.get(action, "⚪")
@@ -80,8 +103,8 @@ def send_exit_alert(
 
     msg = (
         f"{urgency_prefix}*Position Alert: {symbol}* {action_emoji}\n\n"
-        f"*Action Recommended*: `{action}`\n"
-        f"*Current Price*: ₹{current_price}\n"
+        f"*Action*: `{action}`\n"
+        f"*Price*: ₹{current_price}\n"
         f"*P&L*: {pnl_emoji} `{pnl_str}`\n"
     )
     if new_sl and action == "TRAIL_SL":
@@ -91,15 +114,15 @@ def send_exit_alert(
     if action == "EXIT_NOW":
         reply_markup = {
             "inline_keyboard": [[
-                {"text": "✅ Exit Now",   "callback_data": f"EXIT_{execution_id}"},
-                {"text": "⏸ Hold for now", "callback_data": f"HOLD_{execution_id}"},
+                {"text": "✅ Exit Now",      "callback_data": f"EXIT_{execution_id}"},
+                {"text": "⏸ Hold for now",  "callback_data": f"HOLD_{execution_id}"},
             ]]
         }
     elif action == "TRAIL_SL" and new_sl:
         reply_markup = {
             "inline_keyboard": [[
                 {"text": f"✅ Trail SL to ₹{new_sl}", "callback_data": f"TRAILSL_{execution_id}_{new_sl}"},
-                {"text": "⏸ Keep current SL",        "callback_data": f"HOLD_{execution_id}"},
+                {"text": "⏸ Keep current SL",         "callback_data": f"HOLD_{execution_id}"},
             ]]
         }
     else:
@@ -115,8 +138,58 @@ def send_exit_alert(
     return _send(payload)
 
 
+def send_portfolio_advice(advice_list: list) -> bool:
+    """Sends AI advice on existing Kite holdings."""
+    if not advice_list:
+        return True
+
+    urgent = [a for a in advice_list if a.get("urgency") == "URGENT" or a.get("action") in ("EXIT", "ADD_MORE")]
+    normal = [a for a in advice_list if a not in urgent]
+
+    lines = ["💼 *Portfolio Advice Update*\n"]
+    action_emoji = {"HOLD": "⏸ HOLD", "ADD_MORE": "➕ ADD MORE", "EXIT": "🚨 EXIT"}
+
+    for a in urgent:
+        emoji = "🚨" if a.get("action") == "EXIT" else "➕"
+        lines.append(
+            f"{emoji} *{a['symbol']}* — {action_emoji.get(a['action'], a['action'])}\n"
+            f"P&L: {'+' if a.get('pnl_pct',0) >= 0 else ''}{a.get('pnl_pct',0):.1f}%\n"
+            f"_{a.get('rationale', '')[:200]}_\n"
+        )
+
+    if normal:
+        lines.append("*Routine Holdings*:")
+        for a in normal[:5]:
+            lines.append(
+                f"⏸ `{a['symbol']}` {'+' if a.get('pnl_pct',0) >= 0 else ''}{a.get('pnl_pct',0):.1f}% — HOLD"
+            )
+
+    return _send({
+        "chat_id": settings.TELEGRAM_CHAT_ID,
+        "text": "\n".join(lines),
+        "parse_mode": "Markdown",
+    })
+
+
+def send_watchlist_update(new_candidates: list) -> bool:
+    """Notifies about new high-conviction candidates added to watchlist."""
+    if not new_candidates:
+        return True
+    lines = ["🔍 *Watchlist Updated*\n"]
+    for c in new_candidates[:5]:
+        lines.append(
+            f"• `{c['symbol']}` [{c.get('strategy_type','swing')}] | "
+            f"Score: {c.get('conviction_score',0)}/100 | {c.get('direction','BUY')} @ ₹{c.get('proposed_entry',0)}"
+        )
+    return _send({
+        "chat_id": settings.TELEGRAM_CHAT_ID,
+        "text": "\n".join(lines),
+        "parse_mode": "Markdown",
+    })
+
+
 def send_portfolio_summary(positions: list) -> bool:
-    """Daily portfolio snapshot — called from monitor_positions.py."""
+    """Daily portfolio snapshot."""
     if not positions:
         msg = "📋 *Portfolio Summary*\n\nNo open positions."
     else:
@@ -135,7 +208,6 @@ def send_portfolio_summary(positions: list) -> bool:
         lines.append(f"\n*Open Positions*: {len(positions)}")
         lines.append(f"*Avg P&L*: `{'+' if avg_pnl >= 0 else ''}{avg_pnl:.1f}%`")
         msg = "\n".join(lines)
-
     return _send({"chat_id": settings.TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"})
 
 
@@ -154,5 +226,14 @@ def notify_circuit_breaker(reason: str) -> bool:
         f"🛑 *CIRCUIT BREAKER TRIGGERED*\n\n"
         f"*Reason*: {reason}\n\n"
         f"_All new trade entries are paused. Review your positions._"
+    )
+    return _send({"chat_id": settings.TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"})
+
+
+def notify_paper_trade_executed(symbol: str, direction: str, entry: float, qty: int) -> bool:
+    msg = (
+        f"📄 *Paper Trade Opened*\n\n"
+        f"`{symbol}` {direction} x{qty} @ ₹{entry}\n"
+        f"_(Paper mode — no real order placed)_"
     )
     return _send({"chat_id": settings.TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"})

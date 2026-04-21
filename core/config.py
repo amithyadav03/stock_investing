@@ -4,9 +4,14 @@ from dotenv import load_dotenv
 load_dotenv()
 from pydantic_settings import BaseSettings
 
+
 class Settings(BaseSettings):
     # Primary AI — Claude (Anthropic)
     ANTHROPIC_API_KEY: str = ""
+
+    # Claude model selection
+    CLAUDE_SONNET_MODEL: str = "claude-sonnet-4-6"
+    CLAUDE_HAIKU_MODEL: str = "claude-haiku-4-5-20251001"
 
     # Legacy / optional fallback
     OPENAI_API_KEY: str = ""
@@ -51,6 +56,14 @@ class Settings(BaseSettings):
             print(f"[Config] Error loading strategy_config.yaml: {e}")
             return {}
 
+    @property
+    def PAPER_MODE(self) -> bool:
+        return self.strategy.get("capital", {}).get("paper_mode", True)
+
+    @property
+    def PAPER_CAPITAL(self) -> float:
+        return float(self.strategy.get("capital", {}).get("paper_capital", 500000))
+
     def validate_critical_keys(self):
         """Warn at startup about missing critical configuration."""
         issues = []
@@ -62,11 +75,15 @@ class Settings(BaseSettings):
             issues.append("KITE_API_KEY/KITE_ACCESS_TOKEN not set — live orders disabled.")
         if not self.TELEGRAM_WEBHOOK_SECRET:
             issues.append("TELEGRAM_WEBHOOK_SECRET not set — webhook is unauthenticated (dev only).")
+        mode = "PAPER" if self.PAPER_MODE else "LIVE"
+        cap = self.PAPER_CAPITAL if self.PAPER_MODE else self.strategy.get("capital", {}).get("live_capital", 0)
+        print(f"[Config] Mode: {mode} | Capital: ₹{cap:,.0f}")
         for issue in issues:
             print(f"[Config] WARNING: {issue}")
         return len(issues) == 0
 
     class Config:
         env_file = ".env"
+
 
 settings = Settings()
