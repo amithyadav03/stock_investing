@@ -148,6 +148,14 @@ def stage2_technical_confirmation(symbols: list[str]) -> list[dict]:
     """
     import yfinance as yf
     from tools.indicators import ema as calc_ema, adx as calc_adx
+    from core.config import settings as _cfg
+    _risk_cfg = _cfg.strategy.get("risk", {})
+    _scan_cfg = _cfg.strategy.get("scanning", {})
+    _rv_threshold = _scan_cfg.get("stage2_rv_threshold", 1.3)
+    _adx_threshold = _risk_cfg.get("stage2_adx_threshold", 18)
+    _top_n = _scan_cfg.get("pre_screener_top_n", 25)
+    _min_price = _risk_cfg.get("min_stock_price_inr", 50)
+    _min_avg_vol = _risk_cfg.get("min_avg_daily_volume", 100000)
 
     print(f"[Stage 2] Enhanced technical validation for {len(symbols)} symbols...")
 
@@ -190,7 +198,7 @@ def stage2_technical_confirmation(symbols: list[str]) -> list[dict]:
                 latest_open = float(df['Open'].iloc[-1])
 
                 # Price filter: no penny stocks
-                if latest_price < 50:
+                if latest_price < _min_price:
                     continue
 
                 df['EMA_20'] = calc_ema(df, 20)
@@ -200,6 +208,10 @@ def stage2_technical_confirmation(symbols: list[str]) -> list[dict]:
 
                 # Relative volume (vs 20-day average)
                 avg_vol_20 = float(df['Volume'].iloc[-21:-1].mean())
+                # Require recent trading activity (not delisted/suspended)
+                today_volume = float(df['Volume'].iloc[-1]) if not df.empty else 0
+                if today_volume == 0:
+                    continue  # No trades today — stock may be suspended
                 latest_vol = float(df['Volume'].iloc[-1])
                 rel_vol = latest_vol / avg_vol_20 if avg_vol_20 > 0 else 0
 
@@ -218,10 +230,10 @@ def stage2_technical_confirmation(symbols: list[str]) -> list[dict]:
                 # Apply filters
                 is_green_candle = latest_price > latest_open
                 passes = (
-                    rel_vol > 1.3 and
+                    rel_vol > _rv_threshold and
                     latest_price > latest_ema and
                     is_green_candle and
-                    adx_val > 18  # Relaxed slightly from 20 to avoid filtering too many
+                    adx_val > _adx_threshold
                 )
 
                 if passes:
@@ -239,7 +251,7 @@ def stage2_technical_confirmation(symbols: list[str]) -> list[dict]:
     # Sort by composite score: RV × ADX
     confirmed.sort(key=lambda x: x['rv'] * x.get('adx', 1), reverse=True)
     print(f"[Stage 2] {len(confirmed)} passed enhanced technical confirmation.")
-    return confirmed[:25]  # Top 25
+    return confirmed[:_top_n]
 
 
 def stage3_sentiment_guard(candidates: list[dict]) -> list[str]:

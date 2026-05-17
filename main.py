@@ -364,8 +364,38 @@ async def telegram_webhook(request: Request):
                         product=product,
                         price=proposal.proposed_price,
                     )
+                    print(f"[Webhook] Order placed on Kite. Order ID: {order_id}")
+
+                    # Poll order status to confirm fill (AMO orders don't fill immediately)
+                    import time as _time
+                    order_status = "PENDING"
+                    max_polls = 6  # poll up to 6 times, 5 sec apart
+                    for _ in range(max_polls):
+                        try:
+                            orders = kite.orders()
+                            for o in orders:
+                                if str(o.get("order_id")) == str(order_id):
+                                    order_status = o.get("status", "UNKNOWN")
+                                    break
+                        except Exception as poll_err:
+                            print(f"[Webhook] Order status poll failed: {poll_err}")
+                            break
+                        if order_status in ("COMPLETE", "OPEN"):
+                            break
+                        if order_status in ("CANCELLED", "REJECTED"):
+                            break
+                        _time.sleep(5)
+
+                    if order_status in ("CANCELLED", "REJECTED"):
+                        proposal.status = "KITE_FAILED"
+                        session.commit()
+                        from core.telegram_bot import notify_error
+                        notify_error(proposal.symbol, f"Kite order {order_id} was {order_status}. Please re-review.")
+                        print(f"[Webhook] Order {order_id} {order_status}. Proposal marked KITE_FAILED.")
+                        return {"status": "ok", "msg": f"Order {order_status} by Kite."}
+
                     proposal.status = "EXECUTED"
-                    print(f"[Webhook] EXECUTED on Kite. Order ID: {order_id}")
+                    print(f"[Webhook] EXECUTED on Kite. Order ID: {order_id} | Status: {order_status}")
 
                     execution = TradeExecution(
                         proposal_id=proposal.id,
@@ -455,17 +485,38 @@ async def telegram_webhook(request: Request):
                     variety = kite.VARIETY_AMO if order_variety_str == "amo" else kite.VARIETY_REGULAR
                     product = getattr(kite, f"PRODUCT_{strat.get('product_type', 'CNC').upper()}")
                     exit_tx = kite.TRANSACTION_TYPE_SELL if data["direction"] == "BUY" else kite.TRANSACTION_TYPE_BUY
-                    kite.place_order(
+                    exit_order_id = kite.place_order(
                         tradingsymbol=data["symbol"],
                         exchange=kite.EXCHANGE_NSE,
                         transaction_type=exit_tx,
                         quantity=data["quantity"],
-                        variety=variety,
+                        variety=kite.VARIETY_REGULAR,  # Exit always REGULAR (immediate)
                         order_type=kite.ORDER_TYPE_MARKET,
                         product=product,
                     )
-                    mark_position_closed(execution_id, current_price, "MANUAL_EXIT_APPROVED")
-                    print(f"[Webhook] Position #{execution_id} EXITED at ₹{current_price}.")
+                    # Poll exit order status before marking position closed
+                    import time as _time
+                    exit_status = "PENDING"
+                    for _ in range(4):
+                        try:
+                            orders = kite.orders()
+                            for o in orders:
+                                if str(o.get("order_id")) == str(exit_order_id):
+                                    exit_status = o.get("status", "UNKNOWN")
+                                    break
+                        except Exception:
+                            break
+                        if exit_status in ("COMPLETE", "CANCELLED", "REJECTED"):
+                            break
+                        _time.sleep(3)
+
+                    if exit_status == "COMPLETE":
+                        mark_position_closed(execution_id, current_price, "MANUAL_EXIT_APPROVED")
+                        print(f"[Webhook] Position #{execution_id} EXITED. Order {exit_order_id} COMPLETE.")
+                    else:
+                        print(f"[Webhook] Exit order {exit_order_id} status: {exit_status}. Position NOT marked closed.")
+                        from core.telegram_bot import notify_error
+                        notify_error(data["symbol"], f"Exit order {exit_order_id} status={exit_status}. Verify manually on Kite.")
                 except Exception as e:
                     print(f"[Webhook] Exit order failed: {e}")
 

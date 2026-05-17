@@ -168,6 +168,8 @@ class CapitalManager:
         ATR/risk-based position sizing.
         Returns: {quantity, capital_deployed, risk_amount, risk_pct}
         """
+        if entry_price <= 0 or stop_loss <= 0:
+            return {"quantity": 0, "capital_deployed": 0.0, "risk_amount": 0.0, "risk_pct": 0.0}
         total = self.get_total_capital()
         strategy_cfg = settings.strategy.get("strategies", {}).get(strategy_type, {})
         base_risk_pct = strategy_cfg.get("risk_per_trade", 0.01)

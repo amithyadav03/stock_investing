@@ -25,10 +25,13 @@ class CircuitBreaker:
         session = SessionLocal()
         try:
             # 1. Daily loss limit
-            today = date.today()
+            import pytz as _pytz
+            _IST = _pytz.timezone("Asia/Kolkata")
+            _now_ist = datetime.now(_IST)
+            _today_ist_midnight_utc = _now_ist.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(_pytz.utc).replace(tzinfo=None)
             today_closed = session.query(TradeExecution).filter(
                 TradeExecution.status == "CLOSED",
-                TradeExecution.exit_time >= datetime.combine(today, datetime.min.time()),
+                TradeExecution.exit_time >= _today_ist_midnight_utc,
             ).all()
             if today_closed:
                 # Sum absolute P&L, then compare to % of total capital (correct method)

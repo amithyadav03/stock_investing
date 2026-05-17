@@ -81,6 +81,16 @@ class MarketDataTool:
         if invalid > 5:
             return {"error": f"Data integrity failure for {symbol}: {invalid} bad bars."}
 
+        # Check for recent trading activity (delisted/suspended stocks have zero volume recently)
+        recent_volume = df['Volume'].tail(5).sum()
+        if recent_volume == 0:
+            return {"error": f"No trading volume for {symbol} in last 5 days. Possibly delisted or suspended."}
+
+        # Check if stock has reasonable minimum price (NSE stocks below ₹1 are penny/error)
+        current_close = float(df['Close'].iloc[-1])
+        if current_close < 1.0:
+            return {"error": f"Suspiciously low price {current_close:.2f} for {symbol}. Possible data error or delisted."}
+
         # Detect gaps (missing trading days > 5 in a row = suspicious)
         if hasattr(df.index, 'to_series'):
             date_diffs = df.index.to_series().diff().dt.days.dropna()

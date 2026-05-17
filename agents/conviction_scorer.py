@@ -165,9 +165,12 @@ def _rule_based_score(
 ) -> ConvictionScore:
     """Deterministic fallback scorer when LLM is unavailable."""
     tech = 0
-    rsi = technical_data.get("rsi_14", 50) or 50
-    adx = technical_data.get("adx_14", 20) or 20
-    macd = technical_data.get("macd_histogram", 0) or 0
+    rsi_raw = technical_data.get("rsi_14")
+    rsi = rsi_raw if rsi_raw is not None else 50
+    adx_raw = technical_data.get("adx_14")
+    adx = adx_raw if adx_raw is not None else 20
+    macd_raw = technical_data.get("macd_histogram")
+    macd = macd_raw if macd_raw is not None else 0
 
     if 40 <= rsi <= 65: tech += 8
     elif 30 <= rsi < 40 or 65 < rsi <= 75: tech += 4

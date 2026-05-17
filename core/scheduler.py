@@ -9,6 +9,19 @@ from datetime import datetime, time as dtime
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
+from datetime import date as _date
+
+# NSE trading holidays 2025-2026 (update annually)
+NSE_HOLIDAYS = {
+    _date(2025, 1, 26), _date(2025, 2, 26), _date(2025, 3, 14),
+    _date(2025, 3, 31), _date(2025, 4, 10), _date(2025, 4, 14),
+    _date(2025, 4, 18), _date(2025, 5, 1),  _date(2025, 8, 15),
+    _date(2025, 8, 27), _date(2025, 10, 2), _date(2025, 10, 20),
+    _date(2025, 10, 21),_date(2025, 11, 5), _date(2025, 12, 25),
+    _date(2026, 1, 26), _date(2026, 3, 20), _date(2026, 4, 3),
+    _date(2026, 4, 14), _date(2026, 5, 1),  _date(2026, 8, 15),
+    _date(2026, 10, 2), _date(2026, 12, 25),
+}
 
 IST = pytz.timezone("Asia/Kolkata")
 scheduler = BackgroundScheduler(timezone=IST)
@@ -18,14 +31,16 @@ scheduler = BackgroundScheduler(timezone=IST)
 
 def is_market_open() -> bool:
     now = datetime.now(IST)
-    if now.weekday() >= 5:
+    today = now.date()
+    if today.weekday() >= 5 or today in NSE_HOLIDAYS:
         return False
     t = now.time()
     return dtime(9, 15) <= t <= dtime(15, 30)
 
 
 def is_trading_day() -> bool:
-    return datetime.now(IST).weekday() < 5
+    today = datetime.now(IST).date()
+    return today.weekday() < 5 and today not in NSE_HOLIDAYS
 
 
 def is_within_window(start: dtime, end: dtime) -> bool:
