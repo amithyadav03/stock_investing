@@ -132,17 +132,22 @@ def add_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def vwap(df: pd.DataFrame) -> pd.Series:
-    """Volume-Weighted Average Price — daily session VWAP."""
+def vwap(df: pd.DataFrame, window: int = 20) -> pd.Series:
+    """
+    Rolling 20-day VWAP — the correct form for daily OHLCV data.
+    Session VWAP (cumulative) only makes sense on intraday bars; on daily data
+    it drifts monotonically and becomes meaningless after a few days.
+    Rolling VWAP = sum(typical_price × volume, N days) / sum(volume, N days)
+    """
     typical_price = (df['High'] + df['Low'] + df['Close']) / 3
-    cum_tp_vol = (typical_price * df['Volume']).cumsum()
-    cum_vol = df['Volume'].cumsum()
-    return cum_tp_vol / (cum_vol + 1e-10)
+    tp_vol = typical_price * df['Volume']
+    vol_sum = df['Volume'].rolling(window).sum().replace(0, np.nan)
+    return tp_vol.rolling(window).sum() / vol_sum
 
 
-def vwap_deviation(df: pd.DataFrame) -> pd.Series:
-    """% deviation of close from VWAP. Positive = above VWAP (bullish bias)."""
-    vwap_s = vwap(df)
+def vwap_deviation(df: pd.DataFrame, window: int = 20) -> pd.Series:
+    """% deviation of close from rolling VWAP. Positive = above VWAP (bullish)."""
+    vwap_s = vwap(df, window)
     return ((df['Close'] - vwap_s) / vwap_s * 100).round(2)
 
 
@@ -181,26 +186,31 @@ def detect_rsi_divergence(df: pd.DataFrame, lookback: int = 20) -> str:
     if 'RSI_14' not in df.columns or len(df) < lookback + 5:
         return 'NONE'
 
-    recent = df.tail(lookback)
-    price = recent['Close']
-    rsi_s = recent['RSI_14']
+    # Compare the last bar against the prior window — never against itself.
+    # Bug fix: including the last bar in the window means idxmin/idxmax can
+    # point to the last bar, making the comparison always trivially false.
+    last_bar = df.iloc[-1]
+    last_price = float(last_bar['Close'])
+    last_rsi = float(last_bar['RSI_14'])
 
-    # Find price lows and highs
+    prior_window = df.tail(lookback).iloc[:-1]  # lookback bars excluding last
+    if prior_window.empty:
+        return 'NONE'
+
+    price = prior_window['Close']
+    rsi_s = prior_window['RSI_14']
+
     price_min_idx = price.idxmin()
     price_max_idx = price.idxmax()
 
-    # Check for bullish divergence: lower price low but higher RSI low
-    # Compare last bar to the lowest point
-    last_price = price.iloc[-1]
-    last_rsi = rsi_s.iloc[-1]
-    min_price = price.min()
-    min_rsi_at_price_min = rsi_s.loc[price_min_idx] if price_min_idx in rsi_s.index else rsi_s.min()
+    min_price = float(price.min())
+    min_rsi_at_price_min = float(rsi_s.loc[price_min_idx]) if price_min_idx in rsi_s.index else float(rsi_s.min())
 
     if last_price <= min_price * 1.02 and last_rsi > min_rsi_at_price_min + 3:
         return 'BULLISH_DIV'
 
-    max_price = price.max()
-    max_rsi_at_price_max = rsi_s.loc[price_max_idx] if price_max_idx in rsi_s.index else rsi_s.max()
+    max_price = float(price.max())
+    max_rsi_at_price_max = float(rsi_s.loc[price_max_idx]) if price_max_idx in rsi_s.index else float(rsi_s.max())
 
     if last_price >= max_price * 0.98 and last_rsi < max_rsi_at_price_max - 3:
         return 'BEARISH_DIV'

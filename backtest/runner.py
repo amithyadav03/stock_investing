@@ -461,12 +461,16 @@ def _simulate_symbol(
                 exit_reason = "MAX_HOLD"
 
             if exit_reason:
-                # Apply exit cost (slippage + transaction cost)
+                # Transaction costs are already embedded in both prices:
+                #   actual_entry = next_open × (1 + TOTAL_COST_ONE_WAY)   [line ~473]
+                #   exit_price_adj = exit_price × (1 - TOTAL_COST_ONE_WAY)
+                # net_pnl = difference between the two cost-adjusted prices.
+                # Do NOT subtract cost_amt again — that was a double-count.
                 exit_price_adj = exit_price * (1 - TOTAL_COST_ONE_WAY)
                 qty = active_trade['quantity']
-                gross_pnl = (exit_price_adj - active_trade['entry_price']) * qty
-                cost_amt = exit_price * qty * TOTAL_COST_ONE_WAY + active_trade['entry_price'] * qty * TOTAL_COST_ONE_WAY
-                net_pnl = gross_pnl - cost_amt / 2  # Cost already baked into prices
+                net_pnl = (exit_price_adj - active_trade['entry_price']) * qty
+                cost_amt = (active_trade['entry_price'] * qty * TOTAL_COST_ONE_WAY +
+                            exit_price * qty * TOTAL_COST_ONE_WAY)  # for reporting only
                 net_pnl_pct = round((exit_price_adj - active_trade['entry_price']) / active_trade['entry_price'] * 100, 2)
 
                 trade = BacktestTrade(
@@ -480,7 +484,7 @@ def _simulate_symbol(
                     stop_loss=active_trade['stop_loss'],
                     take_profit=active_trade['take_profit'],
                     exit_reason=exit_reason,
-                    gross_pnl=round(gross_pnl, 2),
+                    gross_pnl=round((exit_price - active_trade['entry_price']) * qty, 2),  # pre-cost for reporting
                     cost=round(cost_amt, 2),
                     net_pnl=round(net_pnl, 2),
                     net_pnl_pct=net_pnl_pct,
