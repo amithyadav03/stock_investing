@@ -1,228 +1,541 @@
+"""
+LangGraph analysis nodes — all LLM calls use Claude via core.claude_client.
+Nodes run in parallel: technical_analyst + fundamental_analyst → conviction_filter → risk_manager.
+Supports strategy_type: "swing" | "positional" | "value"
+"""
+
 import os
 import base64
-from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage
-from tenacity import retry, stop_after_attempt, wait_exponential # NEW
+from tenacity import retry, stop_after_attempt, wait_exponential
+
 from agents.state import AgentState, RiskDecision
+from agents.llm_utils import classify_macro, load_prompt as _load_prompt
 from tools.market_data import market_data_tool
-from tools.fundamental_news import fundamental_news_tool
+from tools.fundamental_news import fundamental_news_tool, MacroContext
 from db.memory import retrieve_similar_experiences
 from core.config import settings
+from core.claude_client import get_client, call_structured, call_text
 
+langfuse_handler = None
 try:
     from langfuse.langchain import CallbackHandler as LangfuseCallbackHandler
-    
-    # Langfuse v4 expects keys in os.environ. 
-    # We set them explicitly from settings to ensure everything connects.
     if settings.LANGFUSE_SECRET_KEY and settings.LANGFUSE_PUBLIC_KEY:
         os.environ["LANGFUSE_PUBLIC_KEY"] = settings.LANGFUSE_PUBLIC_KEY
         os.environ["LANGFUSE_SECRET_KEY"] = settings.LANGFUSE_SECRET_KEY
         if settings.LANGFUSE_HOST:
             os.environ["LANGFUSE_HOST"] = settings.LANGFUSE_HOST
-            
         langfuse_handler = LangfuseCallbackHandler()
-        print(f"[Langfuse] ✅ Tracing active → {os.environ.get('LANGFUSE_HOST', 'https://cloud.langfuse.com')}")
-    else:
-        langfuse_handler = None
-        print("[Langfuse] ⚠️  Keys not set in .env — tracing disabled.")
+        print(f"[Langfuse] Tracing active -> {os.environ.get('LANGFUSE_HOST', 'cloud.langfuse.com')}")
 except Exception as e:
-    langfuse_handler = None
-    print(f"[Langfuse] ❌ Failed to initialise handler: {e}")
+    print(f"[Langfuse] Disabled: {e}")
 
-def get_llm():
-    if not settings.OPENAI_API_KEY:
+
+def _encode_image(path: str):
+    if not path or not os.path.exists(path):
         return None
-    return ChatOpenAI(model="gpt-4o", temperature=0, api_key=settings.OPENAI_API_KEY)
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
 
-def encode_image(image_path: str) -> str:
-    with open(image_path, "rb") as image_file:
-        return base64.b64encode(image_file.read()).decode('utf-8')
 
-def load_prompt(filename: str) -> tuple[str, str]:
-    """Loads a prompt file and splits it into system and user parts by '---'"""
-    path = os.path.join(os.path.dirname(__file__), "..", "prompts", filename)
-    with open(path, "r", encoding="utf-8") as f:
-        content = f.read()
-    parts = content.split("---")
-    return parts[0].strip(), parts[1].strip()
+def _strategy_prompt_file(strategy_type: str) -> str:
+    return "positional_analyst.txt" if strategy_type in ("positional", "value") else "technical_analyst.txt"
+
+
+def _get_earnings_threshold(strategy_type: str) -> int:
+    """Returns earnings-proximity threshold in days, read from strategy_config."""
+    return settings.strategy.get("strategies", {}).get(strategy_type, {}).get(
+        "earnings_blackout_days",
+        15 if strategy_type in ("positional", "value") else 10,
+    )
+
+
+def _is_earnings_imminent(symbol: str, days_threshold: int = 10) -> tuple[bool, str]:
+    """
+    Returns (imminent: bool, source: str).
+    Checks multiple sources in priority order:
+    1. NSE corporate actions API (most reliable for Indian markets)
+    2. Screener.in earnings date (scraped from company page)
+    3. yfinance calendar (fallback — often missing for NSE)
+
+    If no source has data, returns (False, "no_data") — caller should treat as UNKNOWN
+    and apply conservative blackout if configured.
+    """
+    from datetime import date as _date
+    import pandas as pd
+
+    today = _date.today()
+
+    # Source 1: NSE corporate actions API
+    try:
+        import requests as _req
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Referer': 'https://www.nseindia.com',
+        }
+        # NSE API for corporate actions: results calendar
+        resp = _req.get(
+            f"https://www.nseindia.com/api/corporates-corporateActions?index=equities&symbol={symbol}&market=equities",
+            headers=headers, timeout=8,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            actions = data if isinstance(data, list) else data.get("data", [])
+            for action in actions[:20]:
+                purpose = str(action.get("purpose", "")).upper()
+                if "RESULT" in purpose or "QUARTER" in purpose or "ANNUAL" in purpose:
+                    ex_date_str = action.get("exDate") or action.get("exdate") or ""
+                    if ex_date_str:
+                        try:
+                            ex_date = pd.Timestamp(ex_date_str).date()
+                            days_away = (ex_date - today).days
+                            if 0 <= days_away <= days_threshold:
+                                return True, "nse_api"
+                        except Exception:
+                            pass
+    except Exception:
+        pass
+
+    # Source 2: yfinance calendar (best-effort for NSE)
+    try:
+        import yfinance as yf
+        ticker = yf.Ticker(f"{symbol}.NS")
+        cal = ticker.calendar
+        if cal is not None and not cal.empty:
+            earnings_dt = None
+            if 'Earnings Date' in cal.index:
+                earnings_dt = cal.loc['Earnings Date'].iloc[0] if hasattr(cal.loc['Earnings Date'], 'iloc') else cal.loc['Earnings Date']
+            elif 'Earnings Date' in cal.columns:
+                earnings_dt = cal['Earnings Date'].iloc[0]
+            if earnings_dt is not None and not pd.isnull(earnings_dt):
+                earnings_date = pd.Timestamp(earnings_dt).date()
+                days_away = (earnings_date - today).days
+                if 0 <= days_away <= days_threshold:
+                    return True, "yfinance"
+                # yfinance returned data but earnings not imminent
+                return False, "yfinance"
+    except Exception:
+        pass
+
+    # No reliable data found — apply conservative quarterly blackout
+    # NSE results season: ~4 weeks after each quarter end (Apr 15–May 15, Jul 15–Aug 15, Oct 15–Nov 15, Jan 15–Feb 15)
+    month = today.month
+    day = today.day
+    in_results_season = any([
+        month == 4 and day >= 15,
+        month == 5 and day <= 15,
+        month == 7 and day >= 15,
+        month == 8 and day <= 15,
+        month == 10 and day >= 15,
+        month == 11 and day <= 15,
+        month == 1 and day >= 15,
+        month == 2 and day <= 15,
+    ])
+    if in_results_season:
+        return True, "results_season_conservative"
+
+    return False, "no_data"
+
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 def technical_analyst_node(state: AgentState) -> dict:
     symbol = state['symbol']
+    strategy_type = state.get('strategy_type', 'swing')
+
     technicals = market_data_tool.fetch_advanced_technicals(symbol)
-    
-    analysis = "[MOCK EXPERT] Baseline mock analysis."
-    llm = get_llm()
-    if llm and "chart_path" in technicals:
+    if "error" in technicals:
+        return {
+            "technical_analysis": technicals,
+            "technical_narrative": f"Data error: {technicals['error']}",
+            "weekly_data": {}, "monthly_data": {}, "timeframe_confluence": 0,
+            "messages": [f"[Technical] ERROR: {technicals['error']}"],
+        }
+
+    weekly_data = market_data_tool.fetch_weekly_data(symbol)
+    monthly_data = {}
+    confluence = 0
+
+    if strategy_type in ("positional", "value"):
+        monthly_data = market_data_tool.fetch_monthly_data(symbol)
+        if technicals.get("weekly_trend") == "UP": confluence += 1
+        if weekly_data.get("weekly_structure") in ("UP", "STRONG_UP", "PULLBACK_IN_UPTREND"): confluence += 1
+        if monthly_data.get("monthly_trend") == "UP": confluence += 1
+    else:
+        if technicals.get("weekly_trend") == "UP": confluence += 1
+        if weekly_data.get("weekly_structure") in ("UP", "STRONG_UP", "PULLBACK_IN_UPTREND"): confluence += 1
+
+    narrative = "[Technical] No AI analysis -- ANTHROPIC_API_KEY not configured."
+    client = get_client()
+    if client:
         try:
-            base64_image = encode_image(technicals['chart_path'])
-            sys_template, user_template = load_prompt("technical_analyst.txt")
-            
-            sys_msg = SystemMessage(content=sys_template)
-            prompt = user_template.format(technicals=technicals)
-            
-            user_msg = HumanMessage(content=[
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_image}"}}
-            ])
-            analysis = llm.invoke([sys_msg, user_msg]).content
+            sys_prompt, user_template = _load_prompt(_strategy_prompt_file(strategy_type))
+            user_text = user_template.format(
+                technicals=technicals,
+                weekly_data=weekly_data,
+                monthly_data=monthly_data,
+                timeframe_confluence=confluence,
+                strategy_type=strategy_type,
+            )
+            image_b64 = _encode_image(technicals.get("chart_path"))
+            narrative = call_text(client, sys_prompt, user_text, image_base64=image_b64)
         except Exception as e:
-            analysis = f"Error processing vision: {e}"
+            narrative = f"[Technical] Analysis failed: {e}"
 
     return {
         "technical_analysis": technicals,
-        "messages": [f"Visual and Math Technicals processed. Findings: {analysis[:50]}..."]
+        "technical_narrative": narrative,
+        "weekly_data": weekly_data,
+        "monthly_data": monthly_data,
+        "timeframe_confluence": confluence,
+        "messages": [
+            f"[Technical] {symbol} ({strategy_type}): RSI={technicals.get('rsi_14')}, "
+            f"ADX={technicals.get('adx_14')}, Confluence={confluence}."
+        ],
     }
 
+
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-def fundamental_sentiment_node(state: AgentState) -> dict:
+def fundamental_analyst_node(state: AgentState) -> dict:
     symbol = state['symbol']
+    strategy_type = state.get('strategy_type', 'swing')
+
     fundamentals = fundamental_news_tool.get_comparative_fundamentals(symbol)
     sentiment = fundamental_news_tool.get_micro_sentiment_score(symbol)
     macro_raw = fundamental_news_tool.get_macro_context()
-    
-    # DYNAMIC MACO SYNTHESIS (NEW)
-    macro = None
-    llm = get_llm()
-    if llm:
+    sector_perf = fundamental_news_tool.get_sector_performance()
+    macro: MacroContext = classify_macro(macro_raw)
+
+    research_dict = {}
+    if strategy_type in ("positional", "value"):
         try:
-            # We use a structured output to classify the current market heartbeat
-            sys_template, user_template = load_prompt("macro_analyst.txt")
-            structured_llm = llm.with_structured_output(MacroContext)
-            
-            prompt = user_template.format(
-                index_performance=macro_raw.get('index_performance'),
-                headlines=chr(10).join(macro_raw.get('headlines', []))
-            )
-            
-            macro = structured_llm.invoke([
-                SystemMessage(content=sys_template), 
-                HumanMessage(content=prompt)
-            ])
-            print(f"[Macro Heartbeat] Determined Regime: {macro.sentiment_enum} ({macro.risk_multiplier}x)")
+            from agents.research_agent import run_deep_research
+            report = run_deep_research(symbol, strategy_type)
+            research_dict = {
+                "research_score": report.research_score,
+                "recommendation": report.recommendation,
+                "business_summary": report.business_summary,
+                "upcoming_catalysts": report.upcoming_catalysts,
+                "key_risks": report.key_risks,
+            }
         except Exception as e:
-            # Rule 3 Compliance: Log exactly what happened and notify potential state degradation
-            print(f"[Macro ERROR] Global Synthesis failed: {e}")
-            macro = MacroContext(
-                sentiment_enum="NEUTRAL", 
-                risk_multiplier=1.0, 
-                summary=f"!! MACRO FAILURE !! {e}. Defaulting to Neutral for safety."
-            )
+            print(f"[Fundamental] Research agent failed for {symbol}: {e}")
 
     return {
         "fundamental_analysis": fundamentals,
         "sentiment_analysis": sentiment,
         "macro_context": macro,
-        "messages": [f"Fundamentals fetched. Macro Sentiment: {macro.sentiment_enum if macro else 'UNKNOWN'}."]
+        "sector_performance": sector_perf,
+        "research_report": research_dict,
+        "messages": [
+            f"[Fundamental] {symbol}: PE={fundamentals.get('pe_ratio')}, ROE={fundamentals.get('roe')}, "
+            f"Sentiment={sentiment.get('label', 'N/A')}. Macro={macro.sentiment_enum}."
+        ],
     }
+
+
+def conviction_filter_node(state: AgentState) -> dict:
+    symbol = state['symbol']
+    strategy_type = state.get('strategy_type', 'swing')
+    tech = state.get("technical_analysis") or {}
+    fund = state.get("fundamental_analysis") or {}
+    sent = state.get("sentiment_analysis") or {}
+    macro = state.get("macro_context")
+    research = state.get("research_report") or {}
+
+    from agents.conviction_scorer import score_conviction
+    score = score_conviction(
+        symbol=symbol,
+        technical_data=tech,
+        fundamental_data=fund,
+        sentiment_data=sent,
+        macro_sentiment=macro.sentiment_enum if macro else "NEUTRAL",
+        macro_risk_multiplier=macro.risk_multiplier if macro else 1.0,
+        research_score=research.get("research_score", 50),
+        strategy_type=strategy_type,
+    )
+
+    return {
+        "conviction_score": score.total,
+        "conviction_passes": score.passes_threshold,
+        "messages": [
+            f"[Conviction] {symbol}: {score.total}/100 ({score.tier}) | "
+            f"{'PASSES' if score.passes_threshold else 'FILTERED'}"
+        ],
+    }
+
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 def risk_manager_node(state: AgentState) -> dict:
     symbol = state['symbol']
-    tech = state.get("technical_analysis", {})
-    fund = state.get("fundamental_analysis", {})
-    sent = state.get("sentiment_analysis", {})
-    macro = state.get("macro_context", None)
-    
+    strategy_type = state.get('strategy_type', 'swing')
+
+    if not state.get("conviction_passes", True):
+        decision = RiskDecision(
+            chain_of_thought_1_technicals="Filtered by conviction scorer.",
+            chain_of_thought_2_fundamentals="Filtered by conviction scorer.",
+            chain_of_thought_3_risk="Filtered by conviction scorer.",
+            proposed_action="HOLD",
+            proposed_entry=0.0, proposed_stop_loss=0.0, proposed_take_profit=0.0,
+            conviction_tier="LOW", win_probability_score=0, risk_percentage=0.0,
+            expected_holding_days=0,
+            final_rationale=f"Conviction score {state.get('conviction_score', 0)}/100 below threshold.",
+        )
+        return {
+            "decision": decision, "is_safe_to_execute": False,
+            "guardrail_warnings": "FILTERED: Below conviction threshold.",
+            "messages": [f"[Risk] {symbol}: FILTERED -- conviction too low."],
+        }
+
+    tech = state.get("technical_analysis") or {}
+    fund = state.get("fundamental_analysis") or {}
+    sent = state.get("sentiment_analysis") or {}
+    macro = state.get("macro_context")
+    narrative = state.get("technical_narrative", "")
+    sector_perf = state.get("sector_performance") or {}
+    weekly_data = state.get("weekly_data") or {}
+    monthly_data = state.get("monthly_data") or {}
+    research = state.get("research_report") or {}
+    confluence = state.get("timeframe_confluence", 0)
+
     rl_context = ""
     try:
-        similar = retrieve_similar_experiences(query_text=str(fund) + str(sent), n_results=1)
-        if similar and similar['documents'] and similar['documents'][0]:
-            rl_context = similar['documents'][0][0]
-    except: pass
+        similar = retrieve_similar_experiences(
+            query_text=f"{symbol} {str(fund)} {str(sent)}", n_results=2
+        )
+        if similar and similar.get('documents') and similar['documents'][0]:
+            rl_context = "\n".join(similar['documents'][0])
+    except Exception:
+        pass
 
-    decision = None
-    llm = get_llm()
-    if llm:
-        structured_llm = llm.with_structured_output(RiskDecision)
-        
-        try:
-            sys_template, user_template = load_prompt("risk_manager.txt")
-            prompt = user_template.format(
-                symbol=symbol,
-                current_price=tech.get('latest_price'),
-                atr_14=tech.get('atr_14'),
-                rsi_14=tech.get('rsi_14'),
-                macd_histogram=tech.get('macd_histogram'),
-                macro_env=macro.sentiment_enum if macro else 'UNKNOWN',
-                macro_risk=macro.risk_multiplier if macro else 1.0,
-                rl_context=rl_context if rl_context else 'No similar past trades found.'
-            )
-            # Tracing is now handled globally by the Graph invoke call in main.py
-            decision = structured_llm.invoke(
-                [SystemMessage(content=sys_template), HumanMessage(content=prompt)]
-            )
-        except Exception as e:
-            print(f"LLM Parsing failed: {e}")
-            decision = RiskDecision(
-                chain_of_thought_1_technicals="FAILED",
-                chain_of_thought_2_fundamentals="FAILED",
-                chain_of_thought_3_risk="FAILED",
-                proposed_action="ERROR",
-                proposed_entry=tech.get('latest_price', 0.0),
-                proposed_stop_loss=0.0,
-                proposed_take_profit=0.0,
-                conviction_tier="LOW",
-                win_probability_score=0,
-                risk_percentage=0.0,
-                expected_holding_days=0,
-                final_rationale=f"AI Reasoning Error: {e}"
-            )
-            
-    if not decision: 
-        decision = RiskDecision(
+    def _fail_decision(reason: str) -> RiskDecision:
+        return RiskDecision(
             chain_of_thought_1_technicals="FAILED",
             chain_of_thought_2_fundamentals="FAILED",
             chain_of_thought_3_risk="FAILED",
             proposed_action="ERROR",
             proposed_entry=tech.get('latest_price', 0.0),
-            proposed_stop_loss=0.0,
-            proposed_take_profit=0.0,
-            conviction_tier="LOW",
-            win_probability_score=0,
-            risk_percentage=0.0,
-            expected_holding_days=0,
-            final_rationale="Reasoning Engine Failure: AI returned no decision."
+            proposed_stop_loss=0.0, proposed_take_profit=0.0,
+            conviction_tier="LOW", win_probability_score=0, risk_percentage=0.0,
+            expected_holding_days=0, final_rationale=reason,
         )
 
-    # 3. PYTHON HARD GUARDRAILS (Protecting Real Money)
+    decision = None
+    client = get_client()
+
+    if client:
+        try:
+            sys_prompt, user_template = _load_prompt("risk_manager.txt")
+            user_text = user_template.format(
+                symbol=symbol, strategy_type=strategy_type,
+                current_price=tech.get('latest_price'),
+                atr_14=tech.get('atr_14'), rsi_14=tech.get('rsi_14'),
+                macd_histogram=tech.get('macd_histogram'), adx_14=tech.get('adx_14'),
+                stoch_k=tech.get('stoch_k'), bb_pct_b=tech.get('bb_pct_b'),
+                ema_20=tech.get('ema_20'), ema_50=tech.get('ema_50'),
+                weekly_trend=tech.get('weekly_trend'),
+                weekly_structure=weekly_data.get('weekly_structure', 'N/A'),
+                weekly_rsi=weekly_data.get('weekly_rsi', 'N/A'),
+                monthly_trend=monthly_data.get('monthly_trend', 'N/A'),
+                timeframe_confluence=confluence,
+                support_levels=tech.get('support_levels'),
+                resistance_levels=tech.get('resistance_levels'),
+                technical_narrative=narrative[:600],
+                pe_ratio=fund.get('pe_ratio'), roe=fund.get('roe'),
+                roce=fund.get('roce', 'N/A'), debt_to_equity=fund.get('debt_to_equity'),
+                promoter_holding=fund.get('promoter_holding', 'N/A'),
+                revenue_growth=fund.get('revenue_growth', 'N/A'),
+                sentiment_score=sent.get('score', 0),
+                sentiment_label=sent.get('label', 'NEUTRAL'),
+                sentiment_summary=sent.get('summary', ''),
+                macro_env=macro.sentiment_enum if macro else 'NEUTRAL',
+                macro_risk=macro.risk_multiplier if macro else 1.0,
+                macro_summary=macro.summary if macro else '',
+                sector_performance=sector_perf,
+                research_score=research.get('research_score', 'N/A'),
+                research_recommendation=research.get('recommendation', 'N/A'),
+                upcoming_catalysts=research.get('upcoming_catalysts', ''),
+                conviction_score=state.get('conviction_score', 0),
+                rl_context=rl_context or "No similar past trades found.",
+            )
+            result = call_structured(
+                client=client, system_prompt=sys_prompt, user_text=user_text,
+                tool_name="submit_trade_decision",
+                tool_description="Submit the final structured trade decision",
+                tool_schema={
+                    "type": "object",
+                    "properties": {
+                        "chain_of_thought_1_technicals":   {"type": "string"},
+                        "chain_of_thought_2_fundamentals": {"type": "string"},
+                        "chain_of_thought_3_risk":         {"type": "string"},
+                        "proposed_action":      {"type": "string", "enum": ["BUY", "SELL", "HOLD"]},
+                        "proposed_entry":       {"type": "number"},
+                        "proposed_stop_loss":   {"type": "number"},
+                        "proposed_take_profit": {"type": "number"},
+                        "conviction_tier":      {"type": "string", "enum": ["HIGH", "MEDIUM", "LOW"]},
+                        "win_probability_score":{"type": "integer", "minimum": 1, "maximum": 100},
+                        "risk_percentage":      {"type": "number"},
+                        "expected_holding_days":{"type": "integer"},
+                        "final_rationale":      {"type": "string"},
+                    },
+                    "required": [
+                        "chain_of_thought_1_technicals", "chain_of_thought_2_fundamentals",
+                        "chain_of_thought_3_risk", "proposed_action", "proposed_entry",
+                        "proposed_stop_loss", "proposed_take_profit", "conviction_tier",
+                        "win_probability_score", "risk_percentage", "expected_holding_days",
+                        "final_rationale",
+                    ],
+                },
+            )
+            if result:
+                decision = RiskDecision(**result)
+        except Exception as e:
+            print(f"[Risk] Claude decision failed for {symbol}: {e}")
+            decision = _fail_decision(f"Claude reasoning error: {e}")
+
+    if not decision:
+        decision = _fail_decision("No LLM client or empty response.")
+
     is_safe = True
     warnings = []
-    
-    # Load strategy from config
-    strategy_risk = settings.strategy.get("risk", {})
-    max_abs_risk = strategy_risk.get("max_absolute_risk_limit", 0.08)
-    min_sl_atr = strategy_risk.get("min_sl_atr_multiplier", 0.5)
-
-    # 3A. Simple Math Sanity
-    if decision.proposed_action == "BUY" and decision.proposed_stop_loss >= decision.proposed_entry:
-        is_safe = False
-        warnings.append("CRITICAL: LLM hallucinations caused Stop Loss to be higher than Entry.")
-        
-    # 3B. ATR SLIPPAGE GUARDRAIL (Volatility Check)
+    strategy_cfg = settings.strategy.get("strategies", {}).get(strategy_type, {})
+    risk_cfg = settings.strategy.get("risk", {})
+    max_abs_risk = risk_cfg.get("max_absolute_risk_per_trade", 0.02)
+    min_sl_atr = risk_cfg.get("min_sl_atr_multiplier", 0.5)
+    min_rr = strategy_cfg.get("min_rr_ratio", 1.5)
     atr = tech.get('atr_14', 0)
-    if decision.proposed_action == "BUY" and atr > 0:
-        min_allowed_sl = decision.proposed_entry - (atr * min_sl_atr)
-        if decision.proposed_stop_loss > min_allowed_sl:
-            is_safe = False
-            warnings.append(f"CRITICAL: Proposed SL {decision.proposed_stop_loss} is too tight. Minimum safe SL given current volatility is {min_allowed_sl} ({min_sl_atr}x ATR).")
 
-    risk_per_tier = strategy_risk.get("risk_per_tier", {"HIGH": 0.015, "MEDIUM": 0.010, "LOW": 0.005})
-    
-    # Force risk percentage based strictly on LLM Conviction
-    if decision.proposed_action in ["BUY", "SELL"]:
-        tier = decision.conviction_tier.upper() if decision.conviction_tier else "LOW"
+    if decision.proposed_action == "BUY":
+        if decision.proposed_stop_loss >= decision.proposed_entry:
+            is_safe = False
+            warnings.append("CRITICAL: Stop loss >= entry (hallucination guard).")
+        if atr > 0:
+            min_sl = decision.proposed_entry - (atr * min_sl_atr)
+            if decision.proposed_stop_loss < min_sl:
+                is_safe = False
+                warnings.append(
+                    f"CRITICAL: SL {decision.proposed_stop_loss:.2f} too tight — breaches minimum buffer. "
+                    f"Min safe SL = {min_sl:.2f} ({min_sl_atr}xATR)."
+                )
+        rr = 0.0
+        if decision.proposed_entry > decision.proposed_stop_loss > 0:
+            risk_pts = decision.proposed_entry - decision.proposed_stop_loss
+            reward_pts = decision.proposed_take_profit - decision.proposed_entry
+            rr = reward_pts / risk_pts if risk_pts > 0 else 0
+        if rr < min_rr:
+            is_safe = False
+            warnings.append(f"CRITICAL: R:R {rr:.1f} below minimum {min_rr}.")
+        # RSI overextension guard: thresholds differ by strategy
+        # Swing: tighter (85/18) — swing trades need clean momentum, not extremes
+        # Positional/Value: stricter (75/25) — longer commitments need healthier setups
+        rsi_val = tech.get('rsi_14', 50) or 50
+        if strategy_type in ("positional", "value"):
+            rsi_ob_thresh, rsi_os_thresh = 75, 25
+        else:
+            rsi_ob_thresh, rsi_os_thresh = 85, 18
+        if rsi_val > rsi_ob_thresh:
+            is_safe = False
+            warnings.append(f"CRITICAL: RSI {rsi_val:.1f} is overbought (>{rsi_ob_thresh} for {strategy_type}). High reversal risk.")
+        elif rsi_val < rsi_os_thresh:
+            is_safe = False
+            warnings.append(f"CRITICAL: RSI {rsi_val:.1f} is oversold (<{rsi_os_thresh} for {strategy_type}). Avoid BUY.")
+        # Earnings calendar gate: configurable threshold per strategy_type
+        if decision.proposed_action == "BUY":
+            try:
+                earnings_threshold = _get_earnings_threshold(strategy_type)
+                imminent, source = _is_earnings_imminent(symbol, days_threshold=earnings_threshold)
+                if imminent:
+                    is_safe = False
+                    source_note = f" (source: {source})"
+                    warnings.append(
+                        f"CRITICAL: Earnings within {earnings_threshold} days for {symbol}{source_note}. "
+                        f"Avoid entry — overnight gap risk."
+                    )
+            except Exception:
+                pass
+        # ATR SL support-level adjustment: if ATR SL falls through a key support level,
+        # raise it to just below the support level (tighter but structurally sound)
+        if decision.proposed_action == "BUY" and decision.proposed_stop_loss > 0:
+            support_levels = tech.get('support_levels', []) or []
+            if support_levels and isinstance(support_levels, list):
+                try:
+                    nearest_support = max(
+                        (s for s in support_levels if isinstance(s, (int, float)) and s < decision.proposed_entry),
+                        default=None
+                    )
+                    if nearest_support and nearest_support > decision.proposed_stop_loss:
+                        # Support level is between our ATR SL and entry — use it as the floor
+                        adjusted_sl = round(nearest_support * 0.995, 2)  # 0.5% below support
+                        if adjusted_sl > decision.proposed_stop_loss:
+                            warnings.append(
+                                f"SL adjusted from {decision.proposed_stop_loss:.2f} to {adjusted_sl:.2f} "
+                                f"(support level at {nearest_support:.2f})."
+                            )
+                            decision.proposed_stop_loss = adjusted_sl
+                except Exception:
+                    pass
+
+        # Volume confirmation: ADX signal must be supported by volume (not distribution)
+        adx_val = tech.get('adx_14', 0) or 0
+        obv_trend = tech.get('obv_trend', 'RISING')
+        if adx_val > 20 and obv_trend == 'FALLING':
+            warnings.append(f"WARNING: ADX={adx_val:.1f} shows trend but OBV is FALLING — possible distribution. Conviction reduced.")
+            # Reduce conviction but don't block (warning only — OBV can lag)
+        if strategy_type == "positional" and confluence < 2:
+            is_safe = False
+            warnings.append(f"CRITICAL: Only {confluence}/3 timeframes aligned for positional trade.")
+
+    elif decision.proposed_action == "SELL":
+        if decision.proposed_stop_loss <= decision.proposed_entry:
+            is_safe = False
+            warnings.append("CRITICAL: Stop loss <= entry for SELL (hallucination guard).")
+        if atr > 0:
+            max_sl = decision.proposed_entry + (atr * min_sl_atr)
+            if decision.proposed_stop_loss < max_sl:
+                is_safe = False
+                warnings.append(
+                    f"CRITICAL: SL {decision.proposed_stop_loss:.2f} too tight for SELL. "
+                    f"Min safe SL = {max_sl:.2f} ({min_sl_atr}xATR above entry)."
+                )
+        rr = 0.0
+        if decision.proposed_entry > decision.proposed_take_profit > 0:
+            risk_pts = decision.proposed_stop_loss - decision.proposed_entry
+            reward_pts = decision.proposed_entry - decision.proposed_take_profit
+            rr = reward_pts / risk_pts if risk_pts > 0 else 0
+        if rr < min_rr:
+            is_safe = False
+            warnings.append(f"CRITICAL: R:R {rr:.1f} below minimum {min_rr} for SELL.")
+
+    risk_per_tier = {
+        "HIGH":   strategy_cfg.get("risk_per_trade", 0.01),
+        "MEDIUM": strategy_cfg.get("risk_per_trade", 0.01) * 0.75,
+        "LOW":    strategy_cfg.get("risk_per_trade", 0.01) * 0.50,
+    }
+    if decision.proposed_action in ("BUY", "SELL"):
+        tier = (decision.conviction_tier or "LOW").upper()
         decision.risk_percentage = risk_per_tier.get(tier, 0.005)
 
-    # 3C. Max Risk per trade limit
+    # Enforce max holding days per strategy
+    max_hold = settings.strategy.get("exit", {}).get(f"max_holding_days_{strategy_type}", 30)
+    if decision.expected_holding_days > max_hold:
+        warnings.append(f"WARNING: Holding days {decision.expected_holding_days} exceeds strategy max {max_hold}d. Capping.")
+        decision.expected_holding_days = max_hold
+
     if decision.risk_percentage > max_abs_risk:
         is_safe = False
-        warnings.append(f"CRITICAL: Proposed risk {decision.risk_percentage} exceeds absolute limit of {max_abs_risk}%.")
+        warnings.append(f"CRITICAL: Risk {decision.risk_percentage:.1%} exceeds max {max_abs_risk:.1%}.")
 
-    # 3D. Macro overriding
     if macro and macro.sentiment_enum == "BEARISH" and decision.proposed_action == "BUY":
-        warnings.append("WARNING: Buying in a Bearish Macro environment. Halving proposed risk footprint.")
-        decision.risk_percentage *= macro.risk_multiplier
+        if confluence < 2:
+            is_safe = False
+            warnings.append(
+                f"CRITICAL: BEARISH macro regime with only {confluence}/3 timeframes aligned. "
+                "Require all major timeframes to agree before entering longs in bear market."
+            )
+        else:
+            decision.risk_percentage = round(decision.risk_percentage * macro.risk_multiplier, 4)
+            warnings.append(
+                f"WARNING: BEARISH macro — position size reduced to {decision.risk_percentage:.1%}. "
+                "Trading allowed because {confluence}/3 timeframes aligned."
+            )
 
     if not is_safe:
         decision.proposed_action = "ABORT_UNSAFE"
@@ -232,5 +545,8 @@ def risk_manager_node(state: AgentState) -> dict:
         "is_safe_to_execute": is_safe,
         "guardrail_warnings": " | ".join(warnings),
         "rl_context": rl_context,
-        "messages": [f"Risk Evaluated. Outcome: {decision.proposed_action}. Safe: {is_safe}"]
+        "messages": [
+            f"[Risk] {symbol} ({strategy_type}): Action={decision.proposed_action}, "
+            f"Conviction={decision.conviction_tier}, Safe={is_safe}."
+        ],
     }

@@ -1,67 +1,147 @@
 # ==============================================================================
-# AI SWING TRADING AGENT - STRATEGY CONFIGURATION
-# ==============================================================================
-# Manage your stock lists, risk parameters, and order settings here.
-# Changes take effect on the next scan/execution.
+# ALPHA AGENT — STRATEGY CONFIGURATION
+# All parameters read at runtime — no code changes needed to tune strategy.
 # ==============================================================================
 
-scanning:
-  # The list of NSE symbols to monitor in the daily or periodic scan.
-  symbols:
-    - RELIANCE
-    - ZOMATO
-    - IREDA
-    - TATASTEEL
-    - SUZLON
-    - HDFCBANK
-    - INFY
-    - PAYTM
-    - TRENT
-    - VEDL
+# ── Capital ────────────────────────────────────────────────────────────────────
+capital:
+  paper_mode: true                      # true = simulation, false = live Kite orders
+  paper_capital: 500000                 # ₹5L virtual capital
+  live_capital: 500000                  # sync from Kite margins in live mode
+  max_concurrent_positions: 5           # total across all strategies
+  min_available_capital: 10000          # don't open new trade below this threshold
 
-  # Delay between dispatching each agent to avoid Kite API rate limits.
-  interval_seconds: 2
+# ── Scheduled Reports (IST, 24-hr) ────────────────────────────────────────────
+reports:
+  morning_brief: "08:30"
+  midday_checkin: "12:30"
+  eod_summary: "17:00"
 
-  # Historical lookback (days) for structural S/R and Weekly Analysis.
-  # Institutional standard is 2+ years (approx 700 days).
-  lookback_days: 700
+# ── Per-Strategy Configuration ────────────────────────────────────────────────
+strategies:
 
-trading:
-  # The total amount of money in the portfolio allocated to this strategy.
-  # This value dictates the dynamic quantity sizing (e.g., 10,00,000 INR).
-  portfolio_capital: 1000000
+  swing:
+    enabled: true
+    max_positions: 3                    # max simultaneous swing positions
+    holding_days_min: 5
+    holding_days_max: 30
+    conviction_threshold: 65            # min 0-100 score to generate a proposal
+    risk_per_trade: 0.01                # 1% of total capital per trade
+    atr_sl_multiplier: 2.0
+    min_rr_ratio: 1.5
+    timeframes: [daily, weekly]
+    earnings_blackout_days: 10          # avoid entering within 10 days of earnings
 
-  # Order Variety: 'AMO' (After Market Order) or 'regular' (Live Market)
-  order_variety: AMO
+  positional:
+    enabled: true
+    max_positions: 2
+    holding_days_min: 30
+    holding_days_max: 180
+    conviction_threshold: 72            # higher bar — longer commitment
+    risk_per_trade: 0.01
+    atr_sl_multiplier: 2.5
+    min_rr_ratio: 2.0
+    timeframes: [daily, weekly, monthly]
+    earnings_blackout_days: 15          # more conservative for longer holds
 
-  # Product Type: 'CNC' (Cash and Carry), 'MIS' (Intraday), 'NRML' (Positional F&O)
-  product_type: CNC
+  value:
+    enabled: false                      # auto-enables when capital >= min_capital_to_activate
+    min_capital_to_activate: 200000     # ₹2L minimum
+    max_positions: 2
+    holding_days_min: 180
+    holding_days_max: 1095              # 3 years
+    conviction_threshold: 78
+    risk_per_trade: 0.015
+    atr_sl_multiplier: 3.0
+    min_rr_ratio: 3.0
+    timeframes: [weekly, monthly]
+    earnings_blackout_days: 20          # value: avoid earnings for 20 days
 
+# ── Risk Guardrails (all strategies) ──────────────────────────────────────────
 risk:
-  # Conviction Tiers Base Risk: This replaces the flat 5% risk.
-  # If Conviction is HIGH, risk 1.5%. MEDIUM = 1.0%. LOW = 0.5%.
-  risk_per_tier:
-    HIGH: 0.015
-    MEDIUM: 0.010
-    LOW: 0.005
+  conviction_multipliers:
+    HIGH:   1.00
+    MEDIUM: 0.75
+    LOW:    0.50
 
-  # Liquidity Constraint: The calculated share quantity can NEVER exceed this 
-  # percentage of the stock's 30-day average daily volume. Prevents getting stuck.
+  max_absolute_risk_per_trade: 0.02     # never risk >2% on any single trade
+  max_portfolio_heat: 0.05              # total capital at risk across all open trades
+  max_position_size_pct: 0.20           # single position ≤ 20% of portfolio
+
   max_liquidity_percent_of_volume: 0.01
-
-  # Stop Loss Width: current_price - (atr_sl_multiplier * ATR).
-  atr_sl_multiplier: 2.0
-
-  # Absolute guardrail: Reject any trade proposing a risk > 8% of equity.
-  max_absolute_risk_limit: 0.08
-
-  # Minimum SL Width: Reject if SL is closer than 0.5x ATR (too tight/noisy).
   min_sl_atr_multiplier: 0.5
 
+  max_daily_loss_pct: 0.01              # 1% daily realized loss → halt (was 2%)
+  max_consecutive_losses: 2             # 2 straight losses → halt (was 3)
+  max_open_positions: 5
+  max_drawdown_from_peak_pct: 0.15     # halt if equity drops 15% from all-time high
+  max_positions_per_sector: 2           # prevent sector concentration
+  transaction_cost_pct: 0.004          # 0.4% round-trip (STT + brokerage + fees)
+  min_stock_price_inr: 50               # don't trade stocks below ₹50 (illiquid penny stocks)
+  min_avg_daily_volume: 100000          # minimum 1L shares/day avg volume
+  correlation_threshold: 0.85          # reject new positions with >85% corr to existing ones
+
+  # VIX-based position sizing multipliers (India VIX)
+  vix_regimes:
+    calm:     { max_vix: 14,  size_multiplier: 1.1 }
+    normal:   { max_vix: 20,  size_multiplier: 1.0 }
+    elevated: { max_vix: 25,  size_multiplier: 0.75 }
+    high:     { max_vix: 999, size_multiplier: 0.5 }
+
+# ── Exit Management ────────────────────────────────────────────────────────────
+exit:
+  monitor_interval_minutes: 10
+  max_holding_days_swing: 30
+  max_holding_days_positional: 180
+  trail_sl_atr_trigger: 1.0
+  emergency_exit_atr_multiplier: 3.0
+
+# ── Scanning ──────────────────────────────────────────────────────────────────
+scanning:
+  interval_seconds: 2
+  lookback_days: 700
+  pre_screener_top_n: 20               # top N from screener sent to deep analysis
+  stage2_rv_threshold: 1.3              # minimum relative volume for Stage 2 pass
+  stage2_adx_threshold: 18              # minimum ADX trend strength for Stage 2 pass
+  fallback_symbols:
+    - RELIANCE
+    - HDFCBANK
+    - INFY
+    - TCS
+    - ICICIBANK
+    - TATAMOTORS
+    - BAJFINANCE
+    - SUNPHARMA
+    - WIPRO
+    - HCLTECH
+
+# ── Order Execution ───────────────────────────────────────────────────────────
+trading:
+  order_variety: AMO
+  product_type: CNC
+  amo_cutoff_time: "09:00"             # IST — approve before this for same-day AMO
+  slippage_tolerance_pct: 0.5           # max % drift from proposed price before aborting
+  order_poll_timeout_seconds: 30        # how long to poll Kite for order confirmation
+  order_poll_interval_seconds: 5        # interval between status polls
+  min_order_value_inr: 5000             # minimum order value (avoid sub-₹5k positions)
+
+# ── News ──────────────────────────────────────────────────────────────────────
 news:
-  # Top tier Indian financial RSS feeds monitored for macro/micro sentiment.
+  check_interval_minutes: 15
   rss_feeds:
     - "https://www.moneycontrol.com/rss/MCtopnews.xml"
     - "https://www.moneycontrol.com/rss/business.xml"
     - "https://economictimes.indiatimes.com/markets/rssfeeds/2146842.cms"
     - "https://www.livemint.com/rss/markets"
+    - "https://www.business-standard.com/rss/markets-106.rss"
+
+# ── Global Market Tickers (for morning brief) ─────────────────────────────────
+global_indices:
+  - {ticker: "^GSPC",    name: "S&P 500"}
+  - {ticker: "^IXIC",    name: "NASDAQ"}
+  - {ticker: "^N225",    name: "Nikkei 225"}
+  - {ticker: "^HSI",     name: "Hang Seng"}
+  - {ticker: "GC=F",     name: "Gold"}
+  - {ticker: "CL=F",     name: "Crude Oil"}
+  - {ticker: "USDINR=X", name: "USD/INR"}
+  - {ticker: "^VIX",     name: "VIX"}

@@ -1,128 +1,443 @@
 import requests
-import feedparser
 from bs4 import BeautifulSoup
 from pydantic import BaseModel
 from typing import Dict, Any, List
 import yfinance as yf
 
+try:
+    import feedparser as _feedparser
+    _HAS_FEEDPARSER = True
+except Exception:
+    _feedparser = None
+    _HAS_FEEDPARSER = False
+
 from core.config import settings
 
+
 class MacroContext(BaseModel):
-    sentiment_enum: str
+    sentiment_enum: str   # "BULLISH" | "NEUTRAL" | "BEARISH"
     risk_multiplier: float
     summary: str
 
+
 class FundamentalNewsTool:
     def __init__(self):
-        # Top tier Indian financial RSS feeds from strategy config
         self.rss_feeds = settings.strategy.get("news", {}).get("rss_feeds", [])
 
     def get_comparative_fundamentals(self, symbol: str) -> Dict[str, Any]:
         """
-        Scrapes Screener.in for precise Indian metrics. Fallback to yfinance if blocked.
-        """
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-        url = f"https://www.screener.in/company/{symbol}/consolidated/"
-        
-        try:
-            response = requests.get(url, headers=headers, timeout=5)
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.text, 'html.parser')
-                
-                # Screener puts key metrics in a 'company-ratios' list
-                ratios = {}
-                ratios_ul = soup.find('ul', id='top-ratios')
-                if ratios_ul:
-                    for li in ratios_ul.find_all('li'):
-                        name = li.find('span', class_='name').text.strip()
-                        value_span = li.find('span', class_='number')
-                        if value_span:
-                            ratios[name] = value_span.text.strip()
-                
-                return {
-                    "source": "screener.in",
-                    "symbol": symbol,
-                    "pe_ratio": ratios.get("Stock P/E", "N/A"),
-                    "roe": ratios.get("ROE", "N/A"),
-                    "roce": ratios.get("ROCE", "N/A"),
-                    "debt_to_equity": ratios.get("Debt to equity", "N/A"),
-                    "promoter_holding": ratios.get("Promoter holding", "N/A")
-                }
-        except Exception as e:
-            print(f"[Fundamentals] Screener failed for {symbol}: {e}. Falling back to yfinance.")
+        Fetches fundamentals with Screener.in as primary, yfinance as fallback.
+        Results cached 24h in TTL cache. Returns standardized numeric fields where possible.
 
-        # Fallback to yfinance
+        DEGRADED MODE: If screener fails and yfinance fallback is missing critical fields
+        (promoter_holding, quality governance data), result includes 'data_quality': 'DEGRADED'
+        flag. Callers should cap conviction scores to prevent trading on incomplete data.
+        """
+        from core.cache import cache, TTL_FUNDAMENTALS
+
+        cache_key = f"fundamentals_{symbol}"
+        cached = cache.get(cache_key)
+        if cached:
+            return cached
+
+        result = self._fetch_screener(symbol)
+        if result.get("error"):
+            result = self._fetch_yfinance(symbol)
+            # Mark as degraded — missing governance/pledge data
+            result["data_quality"] = "DEGRADED"
+            result["data_quality_reason"] = "screener.in unavailable; using yfinance (missing promoter/pledge data)"
+        else:
+            result["data_quality"] = "FULL"
+
+        # Compute quality score
+        result["quality_score"] = self._compute_quality_score(result)
+
+        cache.set(cache_key, result, TTL_FUNDAMENTALS)
+        return result
+
+    def _safe_float(self, val, default=None):
+        """Convert string/number to float, return default on failure."""
+        if val is None or val == "N/A" or val == "":
+            return default
         try:
-            ticker = yf.Ticker(f"{symbol}.NS")
-            info = ticker.info
+            return float(str(val).replace(',', '').replace('%', '').strip())
+        except (ValueError, TypeError):
+            return default
+
+    def _fetch_screener(self, symbol: str) -> Dict[str, Any]:
+        """Scrapes Screener.in with retries and structured extraction."""
+        import time
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                          '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Referer': 'https://www.screener.in',
+        }
+
+        urls_to_try = [
+            f"https://www.screener.in/company/{symbol}/consolidated/",
+            f"https://www.screener.in/company/{symbol}/",
+        ]
+
+        for url in urls_to_try:
+            for attempt in range(3):
+                try:
+                    resp = requests.get(url, headers=headers, timeout=10)
+                    if resp.status_code == 200:
+                        return self._parse_screener_html(resp.text, symbol)
+                    elif resp.status_code == 404:
+                        break  # Symbol not found, try other URL
+                    elif resp.status_code == 429:
+                        time.sleep(2 ** attempt)  # Rate limited
+                        continue
+                except requests.exceptions.Timeout:
+                    if attempt < 2:
+                        time.sleep(1)
+                    continue
+                except Exception as e:
+                    print(f"[Fundamentals] Screener fetch failed for {symbol}: {e}")
+                    break
+
+        # Alert via Telegram that screener data is unavailable (affects fundamental scoring)
+        try:
+            from core.telegram_bot import _send
+            from core.config import settings as _cfg
+            _send({
+                "chat_id": _cfg.TELEGRAM_CHAT_ID,
+                "text": (
+                    f"⚠️ *Screener.in Unavailable*\n\n"
+                    f"Could not fetch fundamentals for `{symbol}`. "
+                    f"Conviction scores will rely on cached or partial data.\n"
+                    f"_Consider manual review before approving {symbol} trades._"
+                ),
+                "parse_mode": "Markdown",
+            })
+        except Exception:
+            pass
+        return {"error": f"Screener unavailable for {symbol}", "symbol": symbol, "source": "none"}
+
+    def _parse_screener_html(self, html: str, symbol: str) -> Dict[str, Any]:
+        """Extract all relevant ratios from Screener.in HTML."""
+        soup = BeautifulSoup(html, 'html.parser')
+        ratios: dict = {}
+
+        # Extract top ratios section
+        ratios_ul = soup.find('ul', id='top-ratios')
+        if ratios_ul:
+            for li in ratios_ul.find_all('li'):
+                name_el = li.find('span', class_='name')
+                val_el = li.find('span', class_='number')
+                if name_el and val_el:
+                    ratios[name_el.text.strip()] = val_el.text.strip()
+
+        # Extract profit and revenue growth from quarterly AND annual tables
+        profit_growth_qoq = "N/A"
+        revenue_growth_qoq = "N/A"
+        revenue_growth_yoy = "N/A"
+        profit_growth_annual = "N/A"
+        try:
+            for table_id in ['quarters', 'profit-loss']:
+                profit_table = soup.find('table', id=table_id)
+                if not profit_table:
+                    continue
+                rows = profit_table.find_all('tr')
+                for row in rows:
+                    cells = row.find_all('td')
+                    if not cells:
+                        continue
+                    row_text = cells[0].text.strip().lower()
+                    vals = []
+                    for c in cells[1:]:
+                        t = c.text.strip().replace(',', '')
+                        if t and t != '':
+                            try:
+                                vals.append(float(t))
+                            except ValueError:
+                                pass
+                    if len(vals) >= 2:
+                        prev, curr = vals[-2], vals[-1]
+                        if prev != 0:
+                            growth = round((curr - prev) / abs(prev) * 100, 1)
+                            if 'net profit' in row_text or 'profit after tax' in row_text:
+                                if table_id == 'quarters':
+                                    profit_growth_qoq = f"{growth}%"
+                                else:
+                                    profit_growth_annual = f"{growth}%"
+                            elif 'revenue' in row_text or 'sales' in row_text:
+                                if table_id == 'quarters':
+                                    revenue_growth_qoq = f"{growth}%"
+                                else:
+                                    revenue_growth_yoy = f"{growth}%"  # Annual revenue growth
+        except Exception:
+            pass
+
+        # Extract EPS if available
+        eps_growth = "N/A"
+        try:
+            for row in soup.find_all('tr'):
+                cells = row.find_all('td')
+                if cells and 'eps' in cells[0].text.lower():
+                    vals = [c.text.strip().replace(',', '') for c in cells[1:] if c.text.strip()]
+                    if len(vals) >= 2:
+                        try:
+                            prev, curr = float(vals[-2]), float(vals[-1])
+                            if prev != 0:
+                                eps_growth = f"{round((curr - prev) / abs(prev) * 100, 1)}%"
+                        except ValueError:
+                            pass
+                    break
+        except Exception:
+            pass
+
+        # Promoter pledge (look in shareholding section)
+        promoter_pledge = "N/A"
+        try:
+            pledge_text = soup.find(string=lambda t: t and 'pledge' in t.lower())
+            if pledge_text:
+                parent = pledge_text.find_parent('td')
+                if parent and parent.find_next_sibling('td'):
+                    promoter_pledge = parent.find_next_sibling('td').text.strip()
+        except Exception:
+            pass
+
+        return {
+            "source": "screener.in",
+            "symbol": symbol,
+            "pe_ratio": self._safe_float(ratios.get("Stock P/E") or ratios.get("P/E")),
+            "roe": self._safe_float(ratios.get("ROE")),
+            "roce": self._safe_float(ratios.get("ROCE")),
+            "debt_to_equity": self._safe_float(ratios.get("Debt to equity") or ratios.get("Debt / Equity")),
+            "promoter_holding": self._safe_float(ratios.get("Promoter holding")),
+            "promoter_pledge": promoter_pledge,
+            "market_cap": ratios.get("Market Cap", "N/A"),
+            "dividend_yield": self._safe_float(ratios.get("Dividend Yield")),
+            "book_value": self._safe_float(ratios.get("Book Value")),
+            "current_ratio": self._safe_float(ratios.get("Current ratio") or ratios.get("Current Ratio")),
+            "profit_growth_qoq": profit_growth_qoq,
+            "profit_growth_annual": profit_growth_annual,
+            "revenue_growth": revenue_growth_qoq,        # QoQ revenue growth
+            "revenue_growth_yoy": revenue_growth_yoy,    # YoY revenue growth (annual table)
+            "eps_growth": eps_growth,
+        }
+
+    def _fetch_yfinance(self, symbol: str) -> Dict[str, Any]:
+        """yfinance fallback — returns standardized dict with numeric fields."""
+        try:
+            info = yf.Ticker(f"{symbol}.NS").info
+            roe_raw = info.get("returnOnEquity")
+            roce_raw = info.get("returnOnAssets")  # yfinance doesn't have ROCE; ROA as proxy
+
             return {
                 "source": "yfinance",
                 "symbol": symbol,
-                "pe_ratio": info.get("trailingPE", "N/A"),
-                "roe": info.get("returnOnEquity", "N/A"),
-                "debt_to_equity": info.get("debtToEquity", "N/A"),
-                # Yfinance lacks promoter pledge natively for India
+                "pe_ratio": self._safe_float(info.get("trailingPE") or info.get("forwardPE")),
+                "roe": round(float(roe_raw) * 100, 2) if roe_raw else None,
+                "roce": round(float(roce_raw) * 100, 2) if roce_raw else None,
+                "debt_to_equity": self._safe_float(info.get("debtToEquity")),
+                "promoter_holding": None,
+                "promoter_pledge": "N/A",
+                "market_cap": info.get("marketCap"),
+                "dividend_yield": self._safe_float(info.get("dividendYield")),
+                "book_value": self._safe_float(info.get("bookValue")),
+                "current_ratio": self._safe_float(info.get("currentRatio")),
+                "profit_growth_qoq": "N/A",
+                "profit_growth_annual": "N/A",
+                "revenue_growth": self._safe_float(info.get("revenueGrowth")),
+                "eps_growth": self._safe_float(info.get("earningsGrowth")),
             }
-        except:
-            return {"error": "Could not fetch fundamentals from any source."}
+        except Exception as e:
+            return {"error": f"yfinance also failed: {e}", "symbol": symbol, "source": "none"}
+
+    def _compute_quality_score(self, data: dict) -> int:
+        """
+        Computes a 0-100 quality score based on fundamentals.
+        Empirically validated factors for Indian equities:
+        - ROCE > 15% (strong moat)
+        - ROE > 15% (efficient equity use)
+        - Debt/Equity < 0.5 (low leverage)
+        - Promoter holding > 50% (skin in the game)
+        - Low promoter pledge (governance risk)
+        - Positive revenue and profit growth
+        """
+        score = 0
+
+        roe = self._safe_float(data.get("roe"), 0)
+        roce = self._safe_float(data.get("roce"), 0)
+        de = self._safe_float(data.get("debt_to_equity"), 99)
+        promoter = self._safe_float(data.get("promoter_holding"), 0)
+        pledge = data.get("promoter_pledge", "N/A")
+        rev_growth = data.get("revenue_growth", "N/A")
+        profit_growth = data.get("profit_growth_qoq", "N/A")
+        cr = self._safe_float(data.get("current_ratio"), 1)
+
+        # ROCE scoring (0-25 pts) - most important for Indian equities
+        if roce and roce >= 20: score += 25
+        elif roce and roce >= 15: score += 20
+        elif roce and roce >= 10: score += 12
+        elif roce and roce >= 5: score += 5
+
+        # ROE scoring (0-20 pts)
+        if roe and roe >= 20: score += 20
+        elif roe and roe >= 15: score += 15
+        elif roe and roe >= 10: score += 8
+        elif roe and roe >= 5: score += 3
+
+        # Debt/Equity (0-20 pts)
+        if de is not None:
+            if de <= 0.1: score += 20
+            elif de <= 0.3: score += 16
+            elif de <= 0.5: score += 12
+            elif de <= 1.0: score += 6
+            elif de > 2.0: score -= 5  # Heavy debt penalty
+
+        # Promoter holding (0-15 pts)
+        if promoter and promoter >= 60: score += 15
+        elif promoter and promoter >= 50: score += 12
+        elif promoter and promoter >= 40: score += 7
+        elif promoter and promoter < 25: score -= 5  # Very low promoter = concern
+
+        # Promoter pledge penalty
+        if pledge != "N/A" and pledge:
+            pledge_val = self._safe_float(pledge, 0)
+            if pledge_val and pledge_val > 50: score -= 15
+            elif pledge_val and pledge_val > 30: score -= 8
+            elif pledge_val and pledge_val > 10: score -= 3
+
+        # Revenue growth (0-10 pts) — require BOTH QoQ and YoY to be positive for full score
+        # This prevents seasonal spikes from inflating scores (G7 fix)
+        rev_f = self._safe_float(str(rev_growth).replace('%', ''), 0)
+        rev_yoy_f = self._safe_float(str(data.get("revenue_growth_yoy", "N/A")).replace('%', ''), None)
+        if rev_f and rev_f >= 20:
+            if rev_yoy_f is not None and rev_yoy_f >= 10:
+                score += 10   # Both QoQ and YoY positive — high confidence
+            else:
+                score += 5    # Only QoQ strong — possibly seasonal
+        elif rev_f and rev_f >= 10:
+            score += 6
+        elif rev_f and rev_f < 0:
+            score -= 5
+        # Additional YoY-only penalty: declining annual revenue
+        if rev_yoy_f is not None and rev_yoy_f < -5:
+            score -= 5
+
+        # Current ratio liquidity (0-5 pts)
+        if cr and cr >= 2.0: score += 5
+        elif cr and cr >= 1.5: score += 3
+        elif cr and cr < 1.0: score -= 3
+
+        return max(0, min(100, score))
 
     def fetch_live_news_snippets(self, target_keyword: str = None) -> List[str]:
-        """
-        Aggregates live RSS feeds. If target_keyword is provided, filters for that stock.
-        Otherwise returns top macro headlines.
-        """
-        headlines = []
+        """Aggregates RSS headlines. Filters by keyword when provided."""
+        if not _HAS_FEEDPARSER:
+            return []
+        headlines: list[str] = []
         for url in self.rss_feeds:
             try:
-                feed = feedparser.parse(url)
-                for entry in feed.entries[:10]: # Top 10 per feed
-                    # Basic filtering for micro
+                feed = _feedparser.parse(url)
+                for entry in feed.entries[:10]:
+                    title = getattr(entry, 'title', '')
+                    desc = getattr(entry, 'description', getattr(entry, 'summary', ''))
                     if target_keyword:
-                        if target_keyword.lower() in entry.title.lower() or target_keyword.lower() in entry.description.lower():
-                            headlines.append(f"{entry.title}: {entry.description[:100]}...")
+                        if target_keyword.lower() in title.lower() or target_keyword.lower() in desc.lower():
+                            headlines.append(f"{title}: {desc[:120]}...")
                     else:
-                        headlines.append(f"{entry.title}: {entry.description[:100]}...")
+                        headlines.append(f"{title}: {desc[:120]}...")
             except Exception as e:
-                print(f"[RSS Error] Failed fetching {url}: {e}")
-                
-        # Deduplicate and return top 15
-        return list(set(headlines))[:15]
+                print(f"[RSS] Failed {url}: {e}")
+        return list(dict.fromkeys(headlines))[:15]  # dedupe, top 15
 
     def get_micro_sentiment_score(self, symbol: str) -> Dict[str, Any]:
         """
-        Retrieves live news for a specific stock snippet.
+        Scores news sentiment for a specific stock using Claude.
+        Returns score (-1.0 to +1.0), label, and key headlines.
         """
         news = self.fetch_live_news_snippets(target_keyword=symbol)
         if not news:
-            return {"score": 0, "summary": f"No immediate breaking news found for {symbol} on Indian RSS feeds."}
-        
-        # Here we would use the map-reduce GPT-4o-mini pass. For architecture proofing:
-        joined_news = "\n".join(news)
-        return {
-            "score": 0, # To be dynamically populated by LLM
-            "summary": f"Found {len(news)} live articles.\nSample: {news[0]}"
-        }
-        
+            return {"score": 0.0, "label": "NEUTRAL", "summary": f"No recent news found for {symbol}."}
+
+        # Use Claude for sentiment scoring
+        try:
+            from core.claude_client import get_client, call_structured
+            client = get_client()
+            if client:
+                result = call_structured(
+                    client=client,
+                    system_prompt=(
+                        "You are a financial news sentiment analyst specializing in Indian equities. "
+                        "Given news headlines for a stock, output a precise sentiment score and label."
+                    ),
+                    user_text=(
+                        f"Analyze the sentiment of these news headlines for {symbol}:\n\n"
+                        + "\n".join(f"- {h}" for h in news)
+                    ),
+                    tool_name="submit_sentiment",
+                    tool_description="Submit the sentiment analysis result",
+                    tool_schema={
+                        "type": "object",
+                        "properties": {
+                            "score": {"type": "number", "description": "Sentiment score from -1.0 (very negative) to +1.0 (very positive)"},
+                            "label": {"type": "string", "enum": ["VERY_BULLISH", "BULLISH", "NEUTRAL", "BEARISH", "VERY_BEARISH"]},
+                            "key_themes": {"type": "string", "description": "2-sentence summary of the key news themes"},
+                        },
+                        "required": ["score", "label", "key_themes"],
+                    },
+                    cache_system=True,
+                )
+                if result:
+                    return {
+                        "score": result.get("score", 0.0),
+                        "label": result.get("label", "NEUTRAL"),
+                        "summary": result.get("key_themes", ""),
+                        "headlines_count": len(news),
+                    }
+        except Exception as e:
+            print(f"[Sentiment] Claude scoring failed for {symbol}: {e}")
+
+        # Fallback: rule-based heuristic
+        pos = sum(1 for h in news if any(w in h.lower() for w in ["surge", "rally", "growth", "profit", "record", "beat", "upgrade"]))
+        neg = sum(1 for h in news if any(w in h.lower() for w in ["fall", "fraud", "loss", "default", "penalty", "decline", "downgrade"]))
+        score = round((pos - neg) / len(news), 2)
+        label = "BULLISH" if score > 0.1 else ("BEARISH" if score < -0.1 else "NEUTRAL")
+        return {"score": score, "label": label, "summary": f"{len(news)} articles. Pos:{pos} Neg:{neg}"}
+
     def get_macro_context(self) -> Dict[str, Any]:
-        """
-        Fetches the broader market headlines and global index performance (Nifty 50, S&P 500)
-        to establish the Macro Environment evidence.
-        """
+        """Global index performance + macro headlines for regime classification."""
         macro_news = self.fetch_live_news_snippets(target_keyword=None)
-        
-        # Global Index Trends (30 Days)
-        index_data = {}
-        for name, ticker in [("Nifty 50", "^NSEI"), ("S&P 500", "^GSPC")]:
+
+        index_data: dict = {}
+        for name, ticker in [
+            ("Nifty 50", "^NSEI"), ("Nifty Bank", "^NSEBANK"),
+            ("S&P 500", "^GSPC"), ("Nasdaq", "^IXIC"), ("Hang Seng", "^HSI"),
+        ]:
             try:
                 df = yf.Ticker(ticker).history(period="30d")
-                perf = (df['Close'].iloc[-1] - df['Close'].iloc[0]) / df['Close'].iloc[0]
-                index_data[name] = f"{'+' if perf > 0 else ''}{round(perf*100, 2)}%"
-            except:
-                index_data[name] = "Data Unavailable"
+                if not df.empty and len(df) >= 2:
+                    perf = (df['Close'].iloc[-1] - df['Close'].iloc[0]) / df['Close'].iloc[0]
+                    index_data[name] = f"{'+' if perf > 0 else ''}{round(perf * 100, 2)}%"
+            except Exception:
+                index_data[name] = "N/A"
 
-        return {
-            "headlines": macro_news,
-            "index_performance": index_data
+        return {"headlines": macro_news, "index_performance": index_data}
+
+    def get_sector_performance(self) -> Dict[str, Any]:
+        """Returns 5-day performance of key NSE sector indices."""
+        sectors = {
+            "Bank": "^NSEBANK", "IT": "^CNXIT", "Pharma": "^CNXPHARMA",
+            "Auto": "^CNXAUTO", "FMCG": "^CNXFMCG", "Energy": "^CNXENERGY",
+            "Metal": "^CNXMETAL", "Realty": "^CNXREALTY",
         }
+        perf: dict = {}
+        for name, ticker in sectors.items():
+            try:
+                df = yf.Ticker(ticker).history(period="5d")
+                if not df.empty and len(df) >= 2:
+                    p = (df['Close'].iloc[-1] - df['Close'].iloc[0]) / df['Close'].iloc[0]
+                    perf[name] = f"{'+' if p > 0 else ''}{round(p * 100, 2)}%"
+            except Exception:
+                perf[name] = "N/A"
+        return perf
+
 
 fundamental_news_tool = FundamentalNewsTool()

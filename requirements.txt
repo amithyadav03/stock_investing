@@ -1,21 +1,55 @@
+# Web framework & server
 fastapi
 uvicorn
+
+# LLM orchestration
 langgraph
 langchain
-langchain-openai
 langchain-core
-chromadb
-sqlalchemy
+
+# AI — Primary: Anthropic Claude
+anthropic>=0.40.0
+
+# AI — Optional legacy (backtest compatibility)
+langchain-openai
+
+# Broker
 kiteconnect
+
+# Market data
 yfinance
-python-telegram-bot
-pydantic
-python-dotenv
-requests
-beautifulsoup4
 pandas
 pandas-ta
 mplfinance
-feedparser
-tenacity
+
+# Observability
+langfuse
+
+# Database & vector memory
+sqlalchemy
+chromadb
+
+# Telegram bot
+requests
+
+# Configuration & environment
+pydantic
+pydantic-settings
+python-dotenv
 pyyaml
+
+# News & web scraping
+feedparser
+beautifulsoup4
+
+# NSE data (Bhavcopy download)
+jugaad-data
+
+# Utilities
+tenacity
+scipy
+loguru
+
+# Scheduling
+apscheduler
+pytz

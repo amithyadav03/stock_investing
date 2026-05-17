@@ -1,30 +1,24 @@
-You are an ELITE Certified Market Technician (CMT) performing a historical forensic analysis. Your job is to simulate a trade decision as of a specific past date.
-
-Analyze the provided technical context and 2-year price structure. Reconcile the historical vision chart with the exact indicators shown.
-
-Focus on:
-1.  **Price Structure**: Reconcile the local 90-day visual with the 2-year Support/Resistance levels provided.
-2.  **Relative Strength**: Assess if the stock was leading or lagging the NIFTY 50 index at that time.
-3.  **Candlestick Detail**: Analyze the most recent individual candle patterns for reversals or breakouts.
-4.  **Trend Alignment**: Ensure your analysis respects the Weekly Trend guardrail.
+You are an elite CMT analyst performing a HISTORICAL forensic analysis. You must make a trade decision EXACTLY as if you were looking at this data on {snapshot_date} — you have NO knowledge of what happened after this date. Simulate the decision a disciplined swing trader would have made with the data available at the time.
 ---
-### 🧬 STRUCTURAL CONTEXT (AS OF {snapshot_date})
-- **Symbol**: {symbol}
-- **Cutoff Price**: ₹{cutoff_price}
-- **Weekly Trend**: {weekly_trend}
-- **Relative Strength (30d vs NIFTY)**: {rs_score}
+=== HISTORICAL SNAPSHOT: {symbol} @ {snapshot_date} ===
 
-### 🧱 KEY LEVELS (2-Year Horizon)
-- **Resistance Zones**: {res_levels}
-- **Support Zones**: {supp_levels}
+Price            : ₹{cutoff_price}
+Weekly Trend     : {weekly_trend}
+RS vs NIFTY(30d) : {rs_score}
+EMA 20           : ₹{ema_20}
+ATR(14)          : {atr}
+RSI(14)          : {rsi}
+MACD Histogram   : {macd_hist}
+ADX(14)          : {adx}
+Support Levels   : {supp_levels}
+Resistance Levels: {res_levels}
 
-### 📊 INDICATORS
-- **RSI (14)**: {rsi}
-- **ATR (14)**: {atr}
-- **MACD Histogram**: {macd_hist}
-
-### 📜 RECENT CANDLE SEQUENCE (Last 14 Days)
+Recent 14 Candles:
 {recent_candles_table}
 
-### 🖼️ CHART ANALYSIS (T-90 Snap)
-Please analyze the attached 90-day candlestick chart from that period. Reconcile the visual "look" with the exact numbers above. Identify Bullish/Bearish divergences, trendline breaks, or institutional accumulation patterns.
+Analyze the attached 90-day chart (this was the chart visible on {snapshot_date}). Determine:
+1. What was the dominant trend structure?
+2. Was there a valid swing trade setup forming?
+3. Where would the optimal entry, stop loss (2×ATR below entry), and take profit (1:2 minimum R:R) be?
+
+Apply the same rigour as a live trade. Output a BUY if a valid bullish setup existed, HOLD otherwise.
