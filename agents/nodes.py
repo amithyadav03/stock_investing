@@ -41,6 +41,31 @@ def _strategy_prompt_file(strategy_type: str) -> str:
     return "positional_analyst.txt" if strategy_type in ("positional", "value") else "technical_analyst.txt"
 
 
+def _is_earnings_imminent(symbol: str, days_threshold: int = 5) -> bool:
+    """Returns True if earnings are within days_threshold trading days."""
+    try:
+        import yfinance as yf
+        ticker = yf.Ticker(f"{symbol}.NS")
+        cal = ticker.calendar
+        if cal is not None and not cal.empty:
+            if 'Earnings Date' in cal.index:
+                earnings_dt = cal.loc['Earnings Date'].iloc[0] if hasattr(cal.loc['Earnings Date'], 'iloc') else cal.loc['Earnings Date']
+            elif 'Earnings Date' in cal.columns:
+                earnings_dt = cal['Earnings Date'].iloc[0]
+            else:
+                return False
+            import pandas as pd
+            if pd.isnull(earnings_dt):
+                return False
+            earnings_date = pd.Timestamp(earnings_dt).date()
+            from datetime import date
+            days_away = (earnings_date - date.today()).days
+            return 0 <= days_away <= days_threshold
+    except Exception:
+        pass
+    return False
+
+
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 def technical_analyst_node(state: AgentState) -> dict:
     symbol = state['symbol']
@@ -62,11 +87,11 @@ def technical_analyst_node(state: AgentState) -> dict:
     if strategy_type in ("positional", "value"):
         monthly_data = market_data_tool.fetch_monthly_data(symbol)
         if technicals.get("weekly_trend") == "UP": confluence += 1
-        if weekly_data.get("weekly_structure") in ("UP", "STRONG_UP"): confluence += 1
+        if weekly_data.get("weekly_structure") in ("UP", "STRONG_UP", "PULLBACK_IN_UPTREND"): confluence += 1
         if monthly_data.get("monthly_trend") == "UP": confluence += 1
     else:
         if technicals.get("weekly_trend") == "UP": confluence += 1
-        if weekly_data.get("weekly_structure") in ("UP", "STRONG_UP"): confluence += 1
+        if weekly_data.get("weekly_structure") in ("UP", "STRONG_UP", "PULLBACK_IN_UPTREND"): confluence += 1
 
     narrative = "[Technical] No AI analysis -- ANTHROPIC_API_KEY not configured."
     client = get_client()
@@ -328,6 +353,28 @@ def risk_manager_node(state: AgentState) -> dict:
         if rr < min_rr:
             is_safe = False
             warnings.append(f"CRITICAL: R:R {rr:.1f} below minimum {min_rr}.")
+        # RSI overextension guard: avoid entries at extremes (high reversal rate)
+        rsi_val = tech.get('rsi_14', 50) or 50
+        if rsi_val > 78:
+            is_safe = False
+            warnings.append(f"CRITICAL: RSI {rsi_val:.1f} is overbought (>78). High reversal risk.")
+        elif rsi_val < 22:
+            is_safe = False
+            warnings.append(f"CRITICAL: RSI {rsi_val:.1f} is oversold (<22). Likely in downtrend — avoid BUY.")
+        # Earnings calendar gate: avoid entering within 5 days of earnings
+        if decision.proposed_action == "BUY":
+            try:
+                if _is_earnings_imminent(symbol, days_threshold=5):
+                    is_safe = False
+                    warnings.append(f"CRITICAL: Earnings within 5 days for {symbol}. Avoid entry — overnight gap risk.")
+            except Exception:
+                pass
+        # Volume confirmation: ADX signal must be supported by volume (not distribution)
+        adx_val = tech.get('adx_14', 0) or 0
+        obv_trend = tech.get('obv_trend', 'RISING')
+        if adx_val > 20 and obv_trend == 'FALLING':
+            warnings.append(f"WARNING: ADX={adx_val:.1f} shows trend but OBV is FALLING — possible distribution. Conviction reduced.")
+            # Reduce conviction but don't block (warning only — OBV can lag)
         if strategy_type == "positional" and confluence < 2:
             is_safe = False
             warnings.append(f"CRITICAL: Only {confluence}/3 timeframes aligned for positional trade.")
@@ -373,8 +420,18 @@ def risk_manager_node(state: AgentState) -> dict:
         warnings.append(f"CRITICAL: Risk {decision.risk_percentage:.1%} exceeds max {max_abs_risk:.1%}.")
 
     if macro and macro.sentiment_enum == "BEARISH" and decision.proposed_action == "BUY":
-        decision.risk_percentage = round(decision.risk_percentage * macro.risk_multiplier, 4)
-        warnings.append(f"WARNING: Bearish macro -- risk reduced to {decision.risk_percentage:.1%}.")
+        if confluence < 2:
+            is_safe = False
+            warnings.append(
+                f"CRITICAL: BEARISH macro regime with only {confluence}/3 timeframes aligned. "
+                "Require all major timeframes to agree before entering longs in bear market."
+            )
+        else:
+            decision.risk_percentage = round(decision.risk_percentage * macro.risk_multiplier, 4)
+            warnings.append(
+                f"WARNING: BEARISH macro — position size reduced to {decision.risk_percentage:.1%}. "
+                "Trading allowed because {confluence}/3 timeframes aligned."
+            )
 
     if not is_safe:
         decision.proposed_action = "ABORT_UNSAFE"

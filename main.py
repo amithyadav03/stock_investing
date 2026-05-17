@@ -272,20 +272,55 @@ async def telegram_webhook(request: Request):
         proposal_id = int(parts[1])
         session = SessionLocal()
         try:
-            proposal = session.query(TradeProposal).filter(TradeProposal.id == proposal_id).first()
-            if not proposal or proposal.status != "PENDING":
-                return {"status": "ok", "msg": "Already processed."}
+            # SELECT FOR UPDATE prevents duplicate webhook execution
+            proposal = session.query(TradeProposal).filter(
+                TradeProposal.id == proposal_id,
+                TradeProposal.status == "PENDING",
+            ).with_for_update().first()
+            if not proposal:
+                return {"status": "ok", "msg": "Already processed or not found."}
 
             is_valid = pre_execution_validation(proposal.symbol, proposal.proposed_price)
             if not is_valid:
                 proposal.status = "ABORTED"
                 session.commit()
-                return {"status": "ok", "msg": "Aborted — price drifted."}
+                return {"status": "ok", "msg": "Aborted — price drifted beyond tolerance."}
 
+            # Price band check: abort if stock moved > 15% from yesterday (approaching circuit)
+            try:
+                from tools.market_data import market_data_tool
+                current_px = market_data_tool.get_current_price(proposal.symbol)
+                if current_px > 0 and proposal.proposed_price > 0:
+                    move_pct = abs(current_px - proposal.proposed_price) / proposal.proposed_price * 100
+                    if move_pct > 15:
+                        proposal.status = "ABORTED"
+                        session.commit()
+                        print(f"[Webhook] {proposal.symbol} moved {move_pct:.1f}% — possible circuit limit. Aborted.")
+                        return {"status": "ok", "msg": f"Aborted — {move_pct:.1f}% price move suggests circuit limit."}
+            except Exception:
+                pass
+
+            # Recalculate position size at approval time using current price and available capital
             qty = max(1, getattr(proposal, 'quantity', 1) or 1)
+            try:
+                from tools.market_data import market_data_tool as _mdt
+                from core.capital_manager import capital_manager
+                live_price = _mdt.get_current_price(proposal.symbol)
+                if live_price > 0 and proposal.stop_loss and abs(live_price - proposal.stop_loss) > 0:
+                    sizing = capital_manager.calculate_position_size(
+                        entry_price=live_price,
+                        stop_loss=proposal.stop_loss,
+                        conviction_tier=proposal.conviction_tier or "MEDIUM",
+                        strategy_type=proposal.strategy_type or "swing",
+                    )
+                    recalc_qty = sizing.get("quantity", 0)
+                    if recalc_qty > 0:
+                        qty = recalc_qty
+                        print(f"[Webhook] Qty recalculated at approval: {qty} (live price ₹{live_price:.2f})")
+            except Exception as e:
+                print(f"[Webhook] Qty recalc failed, using original: {e}")
 
             if settings.PAPER_MODE:
-                # ── Paper trading path ─────────────────────────────────────────
                 try:
                     paper_trade = paper_execute(
                         proposal_id=proposal.id,
@@ -310,7 +345,6 @@ async def telegram_webhook(request: Request):
                     session.commit()
                     print(f"[Webhook] Paper execute failed: {e}")
             else:
-                # ── Live Kite path ─────────────────────────────────────────────
                 try:
                     kite = KiteConnect(api_key=settings.KITE_API_KEY)
                     kite.set_access_token(settings.KITE_ACCESS_TOKEN)

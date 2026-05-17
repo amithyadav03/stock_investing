@@ -102,6 +102,7 @@ class BacktestResults:
     avg_holding_days: float
     trades: List[BacktestTrade] = field(default_factory=list)
     equity_curve: List[dict] = field(default_factory=list)
+    monte_carlo: dict = field(default_factory=dict)
 
 
 # ── Indicator helpers (deterministic, no LLM) ─────────────────────────────────
@@ -376,28 +377,40 @@ def _simulate_symbol(
 
         # Look for new entry (only if no active trade)
         if not active_trade:
-            # Find index in full df for signal generation (use full history for indicators)
             full_idx = df.index.get_loc(current_date) if current_date in df.index else None
             if full_idx is None:
                 continue
 
             signal = _generate_signal(df, full_idx, strategy_type)
             if signal:
-                # Position sizing: risk 1% of current capital
-                risk_amount = capital * params["risk_pct"]
-                risk_per_share = signal['entry_price'] - signal['stop_loss']
+                # Use next bar's Open as entry (can't trade at today's close when decision is made at close)
+                next_idx = full_idx + 1
+                if next_idx >= len(df):
+                    continue
+                next_open = float(df.iloc[next_idx]['Open'])
+                actual_entry = round(next_open * (1 + TOTAL_COST_ONE_WAY), 2)
+
+                # Recalculate SL/TP relative to actual entry (keep same ATR distances)
+                atr_val = signal['atr']
+                params_local = STRATEGY_PARAMS[strategy_type]
+                actual_sl = round(actual_entry - atr_val * params_local["atr_sl_mult"], 2)
+                actual_tp = round(actual_entry + atr_val * params_local["atr_tp_mult"], 2)
+                risk_per_share = actual_entry - actual_sl
                 if risk_per_share <= 0:
                     continue
+
+                risk_amount = capital * params["risk_pct"]
                 quantity = max(1, int(risk_amount / risk_per_share))
-                # Cap at 20% of capital
-                max_qty = max(1, int((capital * 0.20) / signal['entry_price']))
+                max_qty = max(1, int((capital * 0.20) / actual_entry))
                 quantity = min(quantity, max_qty)
 
+                # Use next bar's date as actual entry date
+                next_date = df.index[next_idx]
                 active_trade = {
-                    "entry_date": str(current_date.date()),
-                    "entry_price": signal['entry_price'],
-                    "stop_loss": signal['stop_loss'],
-                    "take_profit": signal['take_profit'],
+                    "entry_date": str(next_date.date()),
+                    "entry_price": actual_entry,
+                    "stop_loss": actual_sl,
+                    "take_profit": actual_tp,
                     "quantity": quantity,
                     "conviction": signal['conviction'],
                 }
@@ -447,6 +460,88 @@ def _compute_max_drawdown(equity_curve: pd.Series) -> float:
     rolling_max = equity_curve.cummax()
     drawdown = (equity_curve - rolling_max) / rolling_max
     return round(float(drawdown.min() * 100), 2)
+
+
+def run_monte_carlo(
+    trades: list,
+    initial_capital: float,
+    n_simulations: int = 1000,
+    risk_free_rate: float = 0.07,
+) -> dict:
+    """
+    Monte Carlo robustness test: shuffle trade order 1000 times.
+    Returns distribution of Sharpe ratios, max drawdowns, and final returns.
+    Industry standard: 5th-percentile Sharpe > 0 indicates genuine robustness.
+    """
+    if len(trades) < 10:
+        return {"error": "Insufficient trades for Monte Carlo (need >= 10)"}
+
+    pnl_list = [t.net_pnl for t in trades]
+    sharpes = []
+    drawdowns = []
+    final_returns = []
+
+    rng = np.random.default_rng(42)
+    for _ in range(n_simulations):
+        shuffled = rng.permutation(pnl_list)
+        equity = initial_capital + np.cumsum(shuffled)
+        equity_series = pd.Series(np.concatenate([[initial_capital], equity]))
+        daily_ret = equity_series.pct_change().dropna()
+        sharpe = _compute_sharpe(daily_ret, risk_free_rate)
+        dd = _compute_max_drawdown(equity_series)
+        total_ret = (equity_series.iloc[-1] - initial_capital) / initial_capital * 100
+        sharpes.append(sharpe)
+        drawdowns.append(dd)
+        final_returns.append(total_ret)
+
+    sharpes_arr = np.array(sharpes)
+    dd_arr = np.array(drawdowns)
+    ret_arr = np.array(final_returns)
+
+    p5_sharpe = float(np.percentile(sharpes_arr, 5))
+    p95_sharpe = float(np.percentile(sharpes_arr, 95))
+    p5_dd = float(np.percentile(dd_arr, 5))
+    median_ret = float(np.median(ret_arr))
+
+    is_robust = p5_sharpe > 0.0
+    print(f"\n[Monte Carlo] {n_simulations} simulations on {len(trades)} trades:")
+    print(f"  Sharpe — median: {np.median(sharpes_arr):.2f} | p5: {p5_sharpe:.2f} | p95: {p95_sharpe:.2f}")
+    print(f"  Max DD — median: {np.median(dd_arr):.1f}% | worst 5%: {p5_dd:.1f}%")
+    print(f"  Return — median: {median_ret:.1f}%")
+    print(f"  Robustness: {'PASS (p5 Sharpe > 0)' if is_robust else 'FAIL (p5 Sharpe <= 0 — strategy fragile)'}")
+
+    return {
+        "n_simulations": n_simulations,
+        "sharpe_median": round(float(np.median(sharpes_arr)), 2),
+        "sharpe_p5": round(p5_sharpe, 2),
+        "sharpe_p95": round(p95_sharpe, 2),
+        "max_dd_median_pct": round(float(np.median(dd_arr)), 2),
+        "max_dd_worst5_pct": round(p5_dd, 2),
+        "return_median_pct": round(median_ret, 2),
+        "is_robust": is_robust,
+    }
+
+
+def compute_walk_forward_efficiency(
+    is_sharpe: float,
+    oos_sharpe: float,
+) -> float:
+    """
+    Walk-Forward Efficiency (WFE) = OOS annualized return / IS annualized return.
+    WFE > 50% = robust; WFE < 30% = overfit.
+    Here we use Sharpe ratio as proxy since it's risk-adjusted.
+    """
+    if is_sharpe <= 0:
+        return 0.0
+    wfe = round(oos_sharpe / is_sharpe * 100, 1)
+    print(f"[WFE] Walk-Forward Efficiency: {wfe}% (IS Sharpe: {is_sharpe:.2f}, OOS Sharpe: {oos_sharpe:.2f})")
+    if wfe >= 50:
+        print(f"  PASS: WFE >= 50% — strategy performance carries to unseen data.")
+    elif wfe >= 30:
+        print(f"  MARGINAL: WFE 30-50% — some overfitting detected.")
+    else:
+        print(f"  FAIL: WFE < 30% — strategy is overfit to in-sample data.")
+    return wfe
 
 
 # ── Main backtest function ─────────────────────────────────────────────────────
@@ -660,6 +755,25 @@ def run_backtest(
         print("CONDITIONAL: Run longer backtest and more symbols before deploying real money.")
     else:
         print("NOT READY: Sharpe < 0.7 or insufficient trades. Do not deploy with real money.")
+
+    # Monte Carlo robustness test
+    mc_results = run_monte_carlo(all_trades, initial_capital)
+    if "error" not in mc_results:
+        results.monte_carlo = mc_results
+
+    # Walk-Forward Efficiency (simplified: compare first half IS vs second half OOS Sharpe)
+    if len(all_trades) >= 20:
+        mid = len(all_trades) // 2
+        is_trades = all_trades[:mid]
+        oos_trades = all_trades[mid:]
+        is_pnls = pd.Series([t.net_pnl for t in is_trades])
+        oos_pnls = pd.Series([t.net_pnl for t in oos_trades])
+        is_rets = is_pnls / initial_capital
+        oos_rets = oos_pnls / initial_capital
+        is_sharpe_val = _compute_sharpe(is_rets)
+        oos_sharpe_val = _compute_sharpe(oos_rets)
+        wfe = compute_walk_forward_efficiency(is_sharpe_val, oos_sharpe_val)
+        print(f"[Backtest] WFE: {wfe}%")
 
     return results
 

@@ -232,8 +232,10 @@ class MarketDataTool:
             df = yf.Ticker(sym).history(period="1d")
             if not df.empty:
                 price = round(float(df['Close'].iloc[-1]), 2)
-        if price > 0:
+        if price > 1.0:  # Minimum sanity check for NSE stocks
             cache.set(cache_key, price, TTL_PRICE)
+        elif price > 0:
+            print(f"[MarketData] Warning: {symbol} price {price} seems too low. Not caching.")
         return price
 
     def fetch_weekly_data(self, symbol: str) -> Dict[str, Any]:
@@ -269,9 +271,18 @@ class MarketDataTool:
         weekly_rsi = float(100 - 100 / (1 + rs.iloc[-1]))
 
         # Trend: price above both EMAs on weekly = strong uptrend
-        weekly_structure = "STRONG_UP" if price > ema20 > ema50 else \
-                           "UP" if price > ema50 else \
-                           "DOWN" if price < ema50 else "SIDEWAYS"
+        if price > ema20 > ema50:
+            weekly_structure = "STRONG_UP"
+        elif price > ema50 and price <= ema20:
+            weekly_structure = "PULLBACK_IN_UPTREND"   # Above 50w but below 20w — potential entry
+        elif price > ema50:
+            weekly_structure = "UP"
+        elif price < ema20 < ema50:
+            weekly_structure = "STRONG_DOWN"
+        elif price < ema50 and price >= ema20:
+            weekly_structure = "BOUNCE_IN_DOWNTREND"   # Below 50w but above 20w — watch for failure
+        else:
+            weekly_structure = "SIDEWAYS"
 
         # 52-week high/low
         high_52w = float(df['High'].tail(52).max())
@@ -348,7 +359,7 @@ class MarketDataTool:
         timeframe_signals = []
         if daily.get("weekly_trend") == "UP":
             timeframe_signals.append(1)
-        if weekly.get("weekly_structure") in ("UP", "STRONG_UP"):
+        if weekly.get("weekly_structure") in ("UP", "STRONG_UP", "PULLBACK_IN_UPTREND"):
             timeframe_signals.append(1)
         if monthly.get("monthly_trend") == "UP":
             timeframe_signals.append(1)

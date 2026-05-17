@@ -31,10 +31,14 @@ class CircuitBreaker:
                 TradeExecution.exit_time >= datetime.combine(today, datetime.min.time()),
             ).all()
             if today_closed:
-                total_pnl_pct = sum(t.realized_pnl_pct or 0 for t in today_closed)
+                # Sum absolute P&L, then compare to % of total capital (correct method)
+                from core.capital_manager import capital_manager
+                total_capital = capital_manager.get_total_capital()
+                total_pnl_abs = sum(t.realized_pnl or 0 for t in today_closed)
+                total_pnl_pct = (total_pnl_abs / total_capital * 100) if total_capital > 0 else 0.0
                 if total_pnl_pct < -(max_daily_loss * 100):
-                    self._log(session, f"Daily loss limit hit: {total_pnl_pct:.1f}%", total_pnl_pct, None)
-                    return False, f"CIRCUIT BREAKER: Daily loss {total_pnl_pct:.1f}% exceeds limit -{max_daily_loss*100:.0f}%."
+                    self._log(session, f"Daily loss limit hit: {total_pnl_pct:.2f}% (Rs{total_pnl_abs:,.0f})", total_pnl_pct, None)
+                    return False, f"CIRCUIT BREAKER: Daily loss {total_pnl_pct:.2f}% of capital exceeds -{max_daily_loss*100:.0f}% limit."
 
             # 2. Consecutive loss streak
             recent = session.query(TradeExecution).filter(

@@ -230,13 +230,13 @@ def detect_macd_divergence(df: pd.DataFrame, lookback: int = 20) -> str:
     min_price = price.min()
     hist_at_price_min = hist.loc[price_min_idx] if price_min_idx in hist.index else hist.min()
 
-    if last_price <= min_price * 1.02 and last_hist > hist_at_price_min + 0.01 and last_hist < 0:
+    if last_price <= min_price * 1.02 and last_hist > hist_at_price_min + 0.01:
         return 'BULLISH_DIV'
 
     max_price = price.max()
     hist_at_price_max = hist.loc[price_max_idx] if price_max_idx in hist.index else hist.max()
 
-    if last_price >= max_price * 0.98 and last_hist < hist_at_price_max - 0.01 and last_hist > 0:
+    if last_price >= max_price * 0.98 and last_hist < hist_at_price_max - 0.01:
         return 'BEARISH_DIV'
 
     return 'NONE'

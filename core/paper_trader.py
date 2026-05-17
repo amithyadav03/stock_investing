@@ -50,10 +50,12 @@ def paper_execute(
 def mark_paper_positions_to_market() -> list[dict]:
     """
     Fetch current prices for all open paper trades and update current_price.
-    Checks SL/TP breaches and auto-closes if hit.
+    Checks SL/TP breaches, auto-closes if hit, and applies trailing stop logic.
     Returns list of positions that were auto-closed.
     """
     from tools.market_data import market_data_tool
+    from tools.indicators import atr as calc_atr
+    import yfinance as yf
 
     session = SessionLocal()
     auto_closed = []
@@ -65,6 +67,44 @@ def mark_paper_positions_to_market() -> list[dict]:
                 if price <= 0:
                     continue
                 trade.current_price = price
+
+                # Trailing stop logic: fetch ATR for dynamic trailing
+                try:
+                    sym = f"{trade.symbol}.NS"
+                    df_atr = yf.Ticker(sym).history(period="30d")
+                    if not df_atr.empty and len(df_atr) >= 14:
+                        atr_val = float(calc_atr(df_atr, 14).iloc[-1])
+                    else:
+                        atr_val = 0.0
+                except Exception:
+                    atr_val = 0.0
+
+                if atr_val > 0 and trade.entry_price and trade.entry_price > 0:
+                    if trade.direction == "BUY":
+                        profit_pts = price - trade.entry_price
+                        if profit_pts >= atr_val * 2:
+                            # Trail to entry + 1× ATR
+                            new_sl = round(trade.entry_price + atr_val, 2)
+                            if new_sl > trade.stop_loss:
+                                trade.stop_loss = new_sl
+                                print(f"[PaperTrader] TRAIL_SL: {trade.symbol} SL -> {new_sl:.2f} (2× ATR profit)")
+                        elif profit_pts >= atr_val:
+                            # Trail to breakeven + 0.3× ATR
+                            new_sl = round(trade.entry_price + atr_val * 0.3, 2)
+                            if new_sl > trade.stop_loss:
+                                trade.stop_loss = new_sl
+                                print(f"[PaperTrader] TRAIL_SL: {trade.symbol} SL -> {new_sl:.2f} (breakeven + buffer)")
+                    elif trade.direction == "SELL":
+                        profit_pts = trade.entry_price - price
+                        if profit_pts >= atr_val * 2:
+                            new_sl = round(trade.entry_price - atr_val, 2)
+                            if new_sl < trade.stop_loss:
+                                trade.stop_loss = new_sl
+                                print(f"[PaperTrader] TRAIL_SL: {trade.symbol} SL -> {new_sl:.2f} (2× ATR profit)")
+                        elif profit_pts >= atr_val:
+                            new_sl = round(trade.entry_price - atr_val * 0.3, 2)
+                            if new_sl < trade.stop_loss:
+                                trade.stop_loss = new_sl
 
                 closed = False
                 if trade.direction == "BUY":
@@ -81,6 +121,16 @@ def mark_paper_positions_to_market() -> list[dict]:
                     elif trade.take_profit and price <= trade.take_profit:
                         _close_paper_trade(session, trade, price, "TAKE_PROFIT")
                         closed = True
+
+                # Time-based exit: close if position is flat (< 1% move) for 15+ days
+                if not closed and trade.entry_time:
+                    holding_days = (datetime.utcnow() - trade.entry_time).days
+                    if holding_days >= 15 and trade.entry_price and trade.entry_price > 0:
+                        unrealized_pct = abs((price - trade.entry_price) / trade.entry_price * 100)
+                        if unrealized_pct < 1.0:
+                            _close_paper_trade(session, trade, price, "TIME_EXIT_FLAT")
+                            closed = True
+                            print(f"[PaperTrader] TIME_EXIT: {trade.symbol} held {holding_days}d with <1% move.")
 
                 if closed:
                     auto_closed.append({"symbol": trade.symbol, "direction": trade.direction,
@@ -106,7 +156,10 @@ def _close_paper_trade(session, trade: PaperTrade, exit_price: float, reason: st
         else:
             pnl_pct = ((trade.entry_price - exit_price) / trade.entry_price) * 100
         trade.realized_pnl_pct = round(pnl_pct, 2)
-        trade.realized_pnl = round((exit_price - trade.entry_price) * trade.quantity, 2)
+        if trade.direction == "BUY":
+            trade.realized_pnl = round((exit_price - trade.entry_price) * trade.quantity, 2)
+        else:
+            trade.realized_pnl = round((trade.entry_price - exit_price) * trade.quantity, 2)
     print(f"[PaperTrader] CLOSED: {trade.symbol} @ ₹{exit_price} | {reason} | P&L: {trade.realized_pnl_pct:.2f}%")
 
 
