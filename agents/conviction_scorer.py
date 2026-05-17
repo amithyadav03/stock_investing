@@ -65,7 +65,8 @@ TECHNICAL DATA:
 - Relative Strength (30d): {technical_data.get('relative_strength_30d', 'N/A')}
 
 FUNDAMENTAL DATA:
-- P/E Ratio: {fundamental_data.get('pe_ratio', 'N/A')}
+- P/E Ratio: {fundamental_data.get('pe_ratio', 'N/A')} (sector median: {fundamental_data.get('sector_pe_median', 'N/A')})
+- PE vs Sector: {_pe_vs_sector_label(fundamental_data)}
 - ROE: {fundamental_data.get('roe', 'N/A')}%
 - ROCE: {fundamental_data.get('roce', 'N/A')}%
 - Debt/Equity: {fundamental_data.get('debt_to_equity', 'N/A')}
@@ -135,6 +136,11 @@ Score each dimension and total. Be precise — do not round to 50s and 70s refle
             elif macro_sentiment == "BULLISH":
                 total = min(100, int(total * 1.05))  # Small bullish boost, capped at 100
 
+            # PE overvaluation penalty: if PE > 1.5× sector median, penalize
+            pe_penalty = _compute_pe_penalty(fundamental_data)
+            if pe_penalty > 0:
+                total = max(0, total - pe_penalty)
+
             tier = "HIGH" if total >= 80 else "MEDIUM" if total >= 65 else "LOW"
             return ConvictionScore(
                 total=total,
@@ -142,7 +148,7 @@ Score each dimension and total. Be precise — do not round to 50s and 70s refle
                 fundamentals=fund,
                 macro_sentiment=macro,
                 research_quality=research,
-                breakdown=result.get("breakdown", ""),
+                breakdown=result.get("breakdown", "") + (f" | PE penalty: -{pe_penalty}" if pe_penalty else ""),
                 tier=tier,
                 passes_threshold=total >= threshold,
             )
@@ -208,6 +214,10 @@ def _rule_based_score(
         except (ValueError, TypeError):
             pass
 
+    # PE overvaluation penalty
+    pe_penalty = _compute_pe_penalty(fundamental_data)
+    fund = max(0, fund - pe_penalty)
+
     macro = {"BULLISH": 17, "NEUTRAL": 13, "BEARISH": 9}.get(macro_sentiment, 13)
 
     research = min(int(research_score * 0.2), 20)
@@ -235,3 +245,53 @@ def _pct_from_ema50(data: dict) -> str:
     if price and ema and ema > 0:
         return str(round((price - ema) / ema * 100, 1))
     return "N/A"
+
+
+def _compute_pe_penalty(fundamental_data: dict) -> int:
+    """
+    PE overvaluation penalty:
+    - PE > 2× sector median → -10 pts (expensive bubble territory)
+    - PE > 1.5× sector median → -5 pts (elevated, reduces conviction)
+    - PE ≤ sector median → 0 (fair/cheap, no penalty)
+    Returns penalty points to subtract from total.
+    """
+    pe_raw = fundamental_data.get("pe_ratio")
+    sector_pe_raw = fundamental_data.get("sector_pe_median")
+    if pe_raw is None or sector_pe_raw is None:
+        return 0
+    try:
+        pe = float(pe_raw)
+        sector_pe = float(sector_pe_raw)
+        if sector_pe <= 0 or pe <= 0:
+            return 0
+        ratio = pe / sector_pe
+        if ratio > 2.0:
+            return 10
+        elif ratio > 1.5:
+            return 5
+        return 0
+    except (ValueError, TypeError):
+        return 0
+
+
+def _pe_vs_sector_label(fundamental_data: dict) -> str:
+    """Returns human-readable PE vs sector label for the LLM prompt."""
+    pe_raw = fundamental_data.get("pe_ratio")
+    sector_pe_raw = fundamental_data.get("sector_pe_median")
+    if pe_raw is None or sector_pe_raw is None:
+        return "N/A"
+    try:
+        pe = float(pe_raw)
+        sector_pe = float(sector_pe_raw)
+        if sector_pe <= 0:
+            return "N/A"
+        ratio = pe / sector_pe
+        if ratio > 2.0:
+            return f"EXPENSIVE ({ratio:.1f}x sector median)"
+        elif ratio > 1.5:
+            return f"ELEVATED ({ratio:.1f}x sector median)"
+        elif ratio < 0.7:
+            return f"CHEAP ({ratio:.1f}x sector median)"
+        return f"FAIR ({ratio:.1f}x sector median)"
+    except (ValueError, TypeError):
+        return "N/A"

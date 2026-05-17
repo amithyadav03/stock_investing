@@ -103,6 +103,7 @@ class BacktestResults:
     trades: List[BacktestTrade] = field(default_factory=list)
     equity_curve: List[dict] = field(default_factory=list)
     monte_carlo: dict = field(default_factory=dict)
+    regime_breakdown: dict = field(default_factory=dict)  # BULL/BEAR/SIDEWAYS trade counts
 
 
 # ── Indicator helpers (deterministic, no LLM) ─────────────────────────────────
@@ -194,9 +195,63 @@ def _rule_based_conviction(row: pd.Series, strategy_type: str = "swing") -> int:
     return max(0, min(100, score))
 
 
+def _classify_market_regime(df: pd.DataFrame, idx: int) -> str:
+    """
+    Classify market regime at bar idx using price vs EMA_200 and ADX.
+    Returns: BULL / BEAR / SIDEWAYS
+    """
+    if idx < 200:
+        return "SIDEWAYS"
+    row = df.iloc[idx]
+    price = float(row.get('Close', 0))
+    ema200 = float(row.get('EMA_200', 0))
+    adx = float(row.get('ADX', 0))
+    ema20 = float(row.get('EMA_20', 0))
+    ema50 = float(row.get('EMA_50', 0))
+
+    if price <= 0 or ema200 <= 0:
+        return "SIDEWAYS"
+
+    above_ema200 = price > ema200
+    trending = adx > 20
+    ema_aligned = ema20 > ema50 > ema200
+
+    if above_ema200 and ema_aligned and trending:
+        return "BULL"
+    elif not above_ema200 and price < ema50 and trending:
+        return "BEAR"
+    return "SIDEWAYS"
+
+
+def _estimate_fill_probability(quantity: int, avg_daily_volume: float) -> float:
+    """
+    Estimate the probability of getting a full fill given order size vs daily volume.
+    Based on market impact / liquidity research:
+      < 0.5% of daily volume → 95% fill probability
+      0.5–1%  → 85%
+      1–2%    → 70%
+      2–5%    → 50%
+      > 5%    → 25% (large impact order)
+    Returns float 0.0–1.0
+    """
+    if avg_daily_volume <= 0:
+        return 0.5  # Unknown liquidity → 50% conservative
+    pct_of_vol = quantity / avg_daily_volume
+    if pct_of_vol < 0.005:
+        return 0.95
+    elif pct_of_vol < 0.01:
+        return 0.85
+    elif pct_of_vol < 0.02:
+        return 0.70
+    elif pct_of_vol < 0.05:
+        return 0.50
+    return 0.25
+
+
 def _generate_signal(df: pd.DataFrame, idx: int, strategy_type: str) -> Optional[dict]:
     """
     Generate a BUY signal at position idx if conviction passes threshold.
+    Applies market regime filter and fill-probability check.
     Returns signal dict or None.
     NOTE: Only BUY signals for simplicity (long-only backtest).
     """
@@ -206,7 +261,18 @@ def _generate_signal(df: pd.DataFrame, idx: int, strategy_type: str) -> Optional
     row = df.iloc[idx]
     params = STRATEGY_PARAMS[strategy_type]
 
+    # Market regime filter: don't enter new BULL positions during BEAR regime
+    regime = _classify_market_regime(df, idx)
+    if regime == "BEAR":
+        return None  # No new longs in bear market
+
     conviction = _rule_based_conviction(row, strategy_type)
+    # Apply regime bonus/penalty
+    if regime == "BULL":
+        conviction = min(100, conviction + 5)
+    elif regime == "SIDEWAYS":
+        conviction = max(0, conviction - 5)
+
     if conviction < params["conviction_threshold"]:
         return None
 
@@ -233,6 +299,7 @@ def _generate_signal(df: pd.DataFrame, idx: int, strategy_type: str) -> Optional
         "atr": atr_val,
         "conviction": conviction,
         "rr": round(rr, 2),
+        "regime": regime,
     }
 
 
@@ -404,6 +471,17 @@ def _simulate_symbol(
                 max_qty = max(1, int((capital * 0.20) / actual_entry))
                 quantity = min(quantity, max_qty)
 
+                # Fill probability check: skip illiquid large orders
+                avg_vol = float(df['Volume'].iloc[max(0, full_idx-30):full_idx].mean()) if full_idx > 0 else 0
+                fill_prob = _estimate_fill_probability(quantity, avg_vol)
+                if fill_prob < 0.70:
+                    # Reduce quantity until fill probability is acceptable
+                    max_fillable = max(1, int(avg_vol * 0.01))  # Max 1% of avg daily vol
+                    quantity = min(quantity, max_fillable)
+                    fill_prob = _estimate_fill_probability(quantity, avg_vol)
+                    if fill_prob < 0.50:
+                        continue  # Skip entirely — too illiquid
+
                 # Use next bar's date as actual entry date
                 next_date = df.index[next_idx]
                 active_trade = {
@@ -413,6 +491,7 @@ def _simulate_symbol(
                     "take_profit": actual_tp,
                     "quantity": quantity,
                     "conviction": signal['conviction'],
+                    "fill_probability": round(fill_prob, 2),
                 }
 
     # Force close any open position at end of window

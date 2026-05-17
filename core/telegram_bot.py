@@ -3,7 +3,26 @@ Telegram notification hub — all user-facing messages route through here.
 """
 
 import requests
+from datetime import datetime
 from core.config import settings
+
+# ── Alert rate limiting ────────────────────────────────────────────────────────
+# Prevents Telegram spam: max 1 exit/trail alert per position per 15 minutes.
+_last_alert_time: dict[str, datetime] = {}
+_ALERT_COOLDOWN_MINUTES = 15
+
+
+def _is_rate_limited(key: str) -> bool:
+    """Returns True if an alert for this key was sent recently."""
+    last = _last_alert_time.get(key)
+    if last is None:
+        return False
+    elapsed = (datetime.utcnow() - last).total_seconds() / 60
+    return elapsed < _ALERT_COOLDOWN_MINUTES
+
+
+def _mark_alerted(key: str):
+    _last_alert_time[key] = datetime.utcnow()
 
 
 def _send(payload: dict) -> bool:
@@ -96,6 +115,14 @@ def send_exit_alert(
     new_sl: float = None,
     urgency: str = "NORMAL",
 ) -> bool:
+    # Rate-limit: skip if we already alerted this position in the last 15 min
+    # (URGENT alerts always go through)
+    alert_key = f"{execution_id}_{action}"
+    if urgency != "URGENT" and _is_rate_limited(alert_key):
+        print(f"[Telegram] Rate-limited: {symbol} {action} alert suppressed (cooldown active).")
+        return True
+    _mark_alerted(alert_key)
+
     urgency_prefix = "🚨 *URGENT* " if urgency == "URGENT" else "📊 "
     action_emoji = {"EXIT_NOW": "🔴", "TRAIL_SL": "🔵", "HOLD": "🟢"}.get(action, "⚪")
     pnl_str = f"{'+' if pnl_pct >= 0 else ''}{pnl_pct:.2f}%"

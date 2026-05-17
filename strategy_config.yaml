@@ -30,6 +30,7 @@ strategies:
     atr_sl_multiplier: 2.0
     min_rr_ratio: 1.5
     timeframes: [daily, weekly]
+    earnings_blackout_days: 10          # avoid entering within 10 days of earnings
 
   positional:
     enabled: true
@@ -41,6 +42,7 @@ strategies:
     atr_sl_multiplier: 2.5
     min_rr_ratio: 2.0
     timeframes: [daily, weekly, monthly]
+    earnings_blackout_days: 15          # more conservative for longer holds
 
   value:
     enabled: false                      # auto-enables when capital >= min_capital_to_activate
@@ -53,6 +55,7 @@ strategies:
     atr_sl_multiplier: 3.0
     min_rr_ratio: 3.0
     timeframes: [weekly, monthly]
+    earnings_blackout_days: 20          # value: avoid earnings for 20 days
 
 # ── Risk Guardrails (all strategies) ──────────────────────────────────────────
 risk:
@@ -76,6 +79,14 @@ risk:
   transaction_cost_pct: 0.004          # 0.4% round-trip (STT + brokerage + fees)
   min_stock_price_inr: 50               # don't trade stocks below ₹50 (illiquid penny stocks)
   min_avg_daily_volume: 100000          # minimum 1L shares/day avg volume
+  correlation_threshold: 0.85          # reject new positions with >85% corr to existing ones
+
+  # VIX-based position sizing multipliers (India VIX)
+  vix_regimes:
+    calm:     { max_vix: 14,  size_multiplier: 1.1 }
+    normal:   { max_vix: 20,  size_multiplier: 1.0 }
+    elevated: { max_vix: 25,  size_multiplier: 0.75 }
+    high:     { max_vix: 999, size_multiplier: 0.5 }
 
 # ── Exit Management ────────────────────────────────────────────────────────────
 exit:

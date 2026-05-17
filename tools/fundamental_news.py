@@ -90,6 +90,22 @@ class FundamentalNewsTool:
                     print(f"[Fundamentals] Screener fetch failed for {symbol}: {e}")
                     break
 
+        # Alert via Telegram that screener data is unavailable (affects fundamental scoring)
+        try:
+            from core.telegram_bot import _send
+            from core.config import settings as _cfg
+            _send({
+                "chat_id": _cfg.TELEGRAM_CHAT_ID,
+                "text": (
+                    f"⚠️ *Screener.in Unavailable*\n\n"
+                    f"Could not fetch fundamentals for `{symbol}`. "
+                    f"Conviction scores will rely on cached or partial data.\n"
+                    f"_Consider manual review before approving {symbol} trades._"
+                ),
+                "parse_mode": "Markdown",
+            })
+        except Exception:
+            pass
         return {"error": f"Screener unavailable for {symbol}", "symbol": symbol, "source": "none"}
 
     def _parse_screener_html(self, html: str, symbol: str) -> Dict[str, Any]:

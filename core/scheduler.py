@@ -430,6 +430,72 @@ def _add_to_watchlist(symbol, strategy_type, decision, score, settings):
         session.close()
 
 
+def job_eod_auto_close():
+    """
+    3:25 PM IST (5 minutes before market close): Force-close all paper positions
+    that are at a loss beyond daily SL so they don't carry overnight risk
+    if the system decides it's prudent. In practice we only close positions
+    where the current price breached the stop_loss that wasn't caught intraday
+    due to gaps.
+    """
+    if not is_trading_day():
+        return
+    try:
+        from db.schema import SessionLocal, PaperTrade
+        from tools.market_data import market_data_tool
+        from core.config import settings
+        if not settings.PAPER_MODE:
+            return  # Live mode: Kite handles this via SL orders
+        session = SessionLocal()
+        try:
+            open_trades = session.query(PaperTrade).filter(PaperTrade.status == "OPEN").all()
+            for trade in open_trades:
+                try:
+                    price = market_data_tool.get_current_price(trade.symbol)
+                    if price <= 0:
+                        continue
+                    sl_breached = (
+                        (trade.direction == "BUY" and price <= trade.stop_loss) or
+                        (trade.direction == "SELL" and price >= trade.stop_loss)
+                    )
+                    if sl_breached:
+                        # Close at SL price (not current — realistic fill)
+                        exit_px = trade.stop_loss
+                        trade.exit_price = exit_px
+                        trade.exit_time = datetime.now(IST).replace(tzinfo=None)
+                        trade.exit_reason = "EOD_SL_CLOSE"
+                        trade.status = "CLOSED"
+                        if trade.entry_price:
+                            if trade.direction == "BUY":
+                                trade.realized_pnl = round((exit_px - trade.entry_price) * (trade.quantity or 0), 2)
+                                trade.realized_pnl_pct = round((exit_px - trade.entry_price) / trade.entry_price * 100, 2)
+                            else:
+                                trade.realized_pnl = round((trade.entry_price - exit_px) * (trade.quantity or 0), 2)
+                                trade.realized_pnl_pct = round((trade.entry_price - exit_px) / trade.entry_price * 100, 2)
+                        print(f"[Scheduler] EOD SL close: {trade.symbol} @ ₹{exit_px}")
+                except Exception as e:
+                    print(f"[Scheduler] EOD auto-close failed for {getattr(trade, 'symbol', '?')}: {e}")
+            session.commit()
+        finally:
+            session.close()
+    except Exception as e:
+        print(f"[Scheduler] eod_auto_close error: {e}")
+
+
+def job_sector_refresh():
+    """Every 30 min during market hours: refresh sector performance cache."""
+    if not is_market_open():
+        return
+    try:
+        from tools.fundamental_news import fundamental_news_tool
+        from core.cache import cache
+        sector_perf = fundamental_news_tool.get_sector_performance()
+        cache.set("sector_performance", sector_perf, 1800)  # 30 min TTL
+        print(f"[Scheduler] Sector performance refreshed: {len(sector_perf)} sectors.")
+    except Exception as e:
+        print(f"[Scheduler] sector_refresh error: {e}")
+
+
 def job_eod_report():
     """5:00 PM: Send EOD summary and new proposal messages."""
     if not is_trading_day():
@@ -503,6 +569,13 @@ def setup_scheduler():
         id="midday_checkin", max_instances=1, replace_existing=True
     )
 
+    # EOD auto-close paper SL positions (5 min before market close)
+    scheduler.add_job(
+        job_eod_auto_close,
+        CronTrigger(day_of_week="mon-fri", hour=15, minute=25, timezone=IST),
+        id="eod_auto_close", max_instances=1, replace_existing=True
+    )
+
     # Post-market analysis
     scheduler.add_job(
         job_post_market_analysis,
@@ -515,6 +588,13 @@ def setup_scheduler():
         job_eod_report,
         CronTrigger(day_of_week="mon-fri", hour=17, minute=0, timezone=IST),
         id="eod_report", max_instances=1, replace_existing=True
+    )
+
+    # Sector performance refresh every 30 min during market hours
+    scheduler.add_job(
+        job_sector_refresh,
+        IntervalTrigger(minutes=30),
+        id="sector_refresh", max_instances=1, replace_existing=True
     )
 
     # Daily housekeeping

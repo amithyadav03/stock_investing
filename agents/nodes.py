@@ -41,8 +41,16 @@ def _strategy_prompt_file(strategy_type: str) -> str:
     return "positional_analyst.txt" if strategy_type in ("positional", "value") else "technical_analyst.txt"
 
 
-def _is_earnings_imminent(symbol: str, days_threshold: int = 5) -> bool:
-    """Returns True if earnings are within days_threshold trading days."""
+def _get_earnings_threshold(strategy_type: str) -> int:
+    """Returns earnings-proximity threshold in days, read from strategy_config."""
+    return settings.strategy.get("strategies", {}).get(strategy_type, {}).get(
+        "earnings_blackout_days",
+        15 if strategy_type in ("positional", "value") else 10,
+    )
+
+
+def _is_earnings_imminent(symbol: str, days_threshold: int = 10) -> bool:
+    """Returns True if earnings are within days_threshold calendar days."""
     try:
         import yfinance as yf
         ticker = yf.Ticker(f"{symbol}.NS")
@@ -361,14 +369,40 @@ def risk_manager_node(state: AgentState) -> dict:
         elif rsi_val < 22:
             is_safe = False
             warnings.append(f"CRITICAL: RSI {rsi_val:.1f} is oversold (<22). Likely in downtrend — avoid BUY.")
-        # Earnings calendar gate: avoid entering within 5 days of earnings
+        # Earnings calendar gate: configurable threshold per strategy_type
         if decision.proposed_action == "BUY":
             try:
-                if _is_earnings_imminent(symbol, days_threshold=5):
+                earnings_threshold = _get_earnings_threshold(strategy_type)
+                if _is_earnings_imminent(symbol, days_threshold=earnings_threshold):
                     is_safe = False
-                    warnings.append(f"CRITICAL: Earnings within 5 days for {symbol}. Avoid entry — overnight gap risk.")
+                    warnings.append(
+                        f"CRITICAL: Earnings within {earnings_threshold} days for {symbol}. "
+                        f"Avoid entry — overnight gap risk."
+                    )
             except Exception:
                 pass
+        # ATR SL support-level adjustment: if ATR SL falls through a key support level,
+        # raise it to just below the support level (tighter but structurally sound)
+        if decision.proposed_action == "BUY" and decision.proposed_stop_loss > 0:
+            support_levels = tech.get('support_levels', []) or []
+            if support_levels and isinstance(support_levels, list):
+                try:
+                    nearest_support = max(
+                        (s for s in support_levels if isinstance(s, (int, float)) and s < decision.proposed_entry),
+                        default=None
+                    )
+                    if nearest_support and nearest_support > decision.proposed_stop_loss:
+                        # Support level is between our ATR SL and entry — use it as the floor
+                        adjusted_sl = round(nearest_support * 0.995, 2)  # 0.5% below support
+                        if adjusted_sl > decision.proposed_stop_loss:
+                            warnings.append(
+                                f"SL adjusted from {decision.proposed_stop_loss:.2f} to {adjusted_sl:.2f} "
+                                f"(support level at {nearest_support:.2f})."
+                            )
+                            decision.proposed_stop_loss = adjusted_sl
+                except Exception:
+                    pass
+
         # Volume confirmation: ADX signal must be supported by volume (not distribution)
         adx_val = tech.get('adx_14', 0) or 0
         obv_trend = tech.get('obv_trend', 'RISING')

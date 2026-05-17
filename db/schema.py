@@ -1,6 +1,7 @@
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, Text
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, Text, UniqueConstraint
 from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime
+import uuid
 from core.config import settings
 
 engine = create_engine(settings.DATABASE_URL, connect_args={"check_same_thread": False})
@@ -31,6 +32,9 @@ class TradeProposal(Base):
     technical_narrative = Column(Text, default="")
     research_summary = Column(Text, default="")
     guardrail_warnings = Column(Text, default="")
+
+    # UUID prevents cross-restart duplicate processing of the same proposal
+    idempotency_token = Column(String, unique=True, nullable=True)
 
     # PENDING → APPROVED → EXECUTED | REJECTED | ABORTED | KITE_FAILED | ABORTED_BY_GUARDRAIL
     status = Column(String, default="PENDING")

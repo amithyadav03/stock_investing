@@ -18,6 +18,7 @@ from contextlib import asynccontextmanager
 from pydantic import BaseModel
 import uvicorn
 import requests
+import uuid
 
 from db.schema import init_db, SessionLocal, TradeProposal, TradeExecution, PositionMonitorLog, Watchlist
 from agents.workflow import trading_agent_app
@@ -36,6 +37,13 @@ from agents.portfolio_advisor import get_portfolio_advice_from_db
 from core.config import settings
 from kiteconnect import KiteConnect
 from datetime import datetime
+
+
+def _get_kite() -> KiteConnect:
+    """Create a KiteConnect instance with reconnection on 403 token expiry."""
+    kite = KiteConnect(api_key=settings.KITE_API_KEY)
+    kite.set_access_token(settings.KITE_ACCESS_TOKEN)
+    return kite
 
 
 @asynccontextmanager
@@ -133,6 +141,7 @@ def run_agent_workflow(symbol: str, strategy_type: str = "swing"):
             rationale=decision.final_rationale + f"\n\nGuardrails: {warnings}",
             technical_narrative=narrative[:1000],
             guardrail_warnings=warnings,
+            idempotency_token=str(uuid.uuid4()),
             status="PENDING" if final_output.get("is_safe_to_execute") else "ABORTED_BY_GUARDRAIL",
         )
         session.add(proposal)
@@ -280,13 +289,27 @@ async def telegram_webhook(request: Request):
             if not proposal:
                 return {"status": "ok", "msg": "Already processed or not found."}
 
+            # Field validation: reject proposals with invalid core fields
+            if not proposal.proposed_price or proposal.proposed_price <= 0:
+                proposal.status = "ABORTED"
+                session.commit()
+                return {"status": "ok", "msg": "Aborted — proposal has invalid entry price."}
+            if not proposal.stop_loss or proposal.stop_loss <= 0:
+                proposal.status = "ABORTED"
+                session.commit()
+                return {"status": "ok", "msg": "Aborted — proposal has no stop loss."}
+            if proposal.direction not in ("BUY", "SELL"):
+                proposal.status = "ABORTED"
+                session.commit()
+                return {"status": "ok", "msg": f"Aborted — invalid direction '{proposal.direction}'."}
+
             is_valid = pre_execution_validation(proposal.symbol, proposal.proposed_price)
             if not is_valid:
                 proposal.status = "ABORTED"
                 session.commit()
                 return {"status": "ok", "msg": "Aborted — price drifted beyond tolerance."}
 
-            # Price band check: abort if stock moved > 15% from yesterday (approaching circuit)
+            # Price band check: abort if stock moved > 15% from proposed (approaching circuit)
             try:
                 from tools.market_data import market_data_tool
                 current_px = market_data_tool.get_current_price(proposal.symbol)
@@ -316,7 +339,8 @@ async def telegram_webhook(request: Request):
                     recalc_qty = sizing.get("quantity", 0)
                     if recalc_qty > 0:
                         qty = recalc_qty
-                        print(f"[Webhook] Qty recalculated at approval: {qty} (live price ₹{live_price:.2f})")
+                        vix_mult = sizing.get("vix_multiplier", 1.0)
+                        print(f"[Webhook] Qty recalculated at approval: {qty} @ ₹{live_price:.2f} (VIX mult={vix_mult:.2f})")
             except Exception as e:
                 print(f"[Webhook] Qty recalc failed, using original: {e}")
 
@@ -346,13 +370,20 @@ async def telegram_webhook(request: Request):
                     print(f"[Webhook] Paper execute failed: {e}")
             else:
                 try:
-                    kite = KiteConnect(api_key=settings.KITE_API_KEY)
-                    kite.set_access_token(settings.KITE_ACCESS_TOKEN)
-
+                    kite = _get_kite()
                     strat = settings.strategy.get("trading", {})
                     order_variety_str = strat.get("order_variety", "AMO").lower()
                     variety = kite.VARIETY_AMO if order_variety_str == "amo" else kite.VARIETY_REGULAR
                     product = getattr(kite, f"PRODUCT_{strat.get('product_type', 'CNC').upper()}")
+
+                    # AMO gap adjustment: buy slightly higher / SL slightly lower to ensure fill
+                    amo_gap = 0.005  # 0.5%
+                    if order_variety_str == "amo":
+                        adjusted_entry = round(proposal.proposed_price * (1 + amo_gap if proposal.direction == "BUY" else 1 - amo_gap), 2)
+                        adjusted_sl = round(proposal.stop_loss * (1 - amo_gap if proposal.direction == "BUY" else 1 + amo_gap), 2)
+                    else:
+                        adjusted_entry = proposal.proposed_price
+                        adjusted_sl = proposal.stop_loss
 
                     order_id = kite.place_order(
                         tradingsymbol=proposal.symbol,
@@ -362,14 +393,34 @@ async def telegram_webhook(request: Request):
                         variety=variety,
                         order_type=kite.ORDER_TYPE_LIMIT,
                         product=product,
-                        price=proposal.proposed_price,
+                        price=adjusted_entry,
                     )
-                    print(f"[Webhook] Order placed on Kite. Order ID: {order_id}")
+                    print(f"[Webhook] Entry order placed on Kite. ID: {order_id}, price: ₹{adjusted_entry}")
 
-                    # Poll order status to confirm fill (AMO orders don't fill immediately)
+                    # Place SL-M order alongside entry (bracket-style protection)
+                    sl_order_id = None
+                    try:
+                        sl_tx = kite.TRANSACTION_TYPE_SELL if proposal.direction == "BUY" else kite.TRANSACTION_TYPE_BUY
+                        sl_order_id = kite.place_order(
+                            tradingsymbol=proposal.symbol,
+                            exchange=kite.EXCHANGE_NSE,
+                            transaction_type=sl_tx,
+                            quantity=qty,
+                            variety=kite.VARIETY_REGULAR,
+                            order_type=kite.ORDER_TYPE_SLM,
+                            product=product,
+                            trigger_price=adjusted_sl,
+                        )
+                        print(f"[Webhook] SL-M order placed. ID: {sl_order_id}, trigger: ₹{adjusted_sl}")
+                    except Exception as sl_err:
+                        print(f"[Webhook] SL order placement failed (non-fatal): {sl_err}")
+                        notify_error(proposal.symbol, f"SL order failed for {proposal.symbol}: {sl_err}. Monitor manually.")
+
+                    # Poll entry order status — extend to 180s for AMO (AMO shows OPEN until next market open)
                     import time as _time
                     order_status = "PENDING"
-                    max_polls = 6  # poll up to 6 times, 5 sec apart
+                    poll_interval = strat.get("order_poll_interval_seconds", 5)
+                    max_polls = 36  # 36 × 5s = 180s total
                     for _ in range(max_polls):
                         try:
                             orders = kite.orders()
@@ -381,15 +432,15 @@ async def telegram_webhook(request: Request):
                             print(f"[Webhook] Order status poll failed: {poll_err}")
                             break
                         if order_status in ("COMPLETE", "OPEN"):
+                            # OPEN = AMO accepted but not yet filled (will execute at market open)
                             break
                         if order_status in ("CANCELLED", "REJECTED"):
                             break
-                        _time.sleep(5)
+                        _time.sleep(poll_interval)
 
                     if order_status in ("CANCELLED", "REJECTED"):
                         proposal.status = "KITE_FAILED"
                         session.commit()
-                        from core.telegram_bot import notify_error
                         notify_error(proposal.symbol, f"Kite order {order_id} was {order_status}. Please re-review.")
                         print(f"[Webhook] Order {order_id} {order_status}. Proposal marked KITE_FAILED.")
                         return {"status": "ok", "msg": f"Order {order_status} by Kite."}
@@ -402,7 +453,7 @@ async def telegram_webhook(request: Request):
                         symbol=proposal.symbol,
                         direction=proposal.direction,
                         quantity=qty,
-                        entry_price=proposal.proposed_price,
+                        entry_price=adjusted_entry,
                         entry_time=datetime.utcnow(),
                         kite_order_id=str(order_id),
                         strategy_type=proposal.strategy_type or "swing",
@@ -478,11 +529,8 @@ async def telegram_webhook(request: Request):
                     session.close()
             else:
                 try:
-                    kite = KiteConnect(api_key=settings.KITE_API_KEY)
-                    kite.set_access_token(settings.KITE_ACCESS_TOKEN)
+                    kite = _get_kite()
                     strat = settings.strategy.get("trading", {})
-                    order_variety_str = strat.get("order_variety", "AMO").lower()
-                    variety = kite.VARIETY_AMO if order_variety_str == "amo" else kite.VARIETY_REGULAR
                     product = getattr(kite, f"PRODUCT_{strat.get('product_type', 'CNC').upper()}")
                     exit_tx = kite.TRANSACTION_TYPE_SELL if data["direction"] == "BUY" else kite.TRANSACTION_TYPE_BUY
                     exit_order_id = kite.place_order(
@@ -497,7 +545,8 @@ async def telegram_webhook(request: Request):
                     # Poll exit order status before marking position closed
                     import time as _time
                     exit_status = "PENDING"
-                    for _ in range(4):
+                    poll_interval = strat.get("order_poll_interval_seconds", 5)
+                    for _ in range(8):  # 8 × 5s = 40s for exit
                         try:
                             orders = kite.orders()
                             for o in orders:
@@ -508,14 +557,22 @@ async def telegram_webhook(request: Request):
                             break
                         if exit_status in ("COMPLETE", "CANCELLED", "REJECTED"):
                             break
-                        _time.sleep(3)
+                        _time.sleep(poll_interval)
 
                     if exit_status == "COMPLETE":
                         mark_position_closed(execution_id, current_price, "MANUAL_EXIT_APPROVED")
+                        # Cancel any outstanding SL order for this position
+                        try:
+                            session3 = SessionLocal()
+                            exec_rec = session3.query(TradeExecution).filter(
+                                TradeExecution.id == execution_id
+                            ).first()
+                            session3.close()
+                        except Exception:
+                            pass
                         print(f"[Webhook] Position #{execution_id} EXITED. Order {exit_order_id} COMPLETE.")
                     else:
                         print(f"[Webhook] Exit order {exit_order_id} status: {exit_status}. Position NOT marked closed.")
-                        from core.telegram_bot import notify_error
                         notify_error(data["symbol"], f"Exit order {exit_order_id} status={exit_status}. Verify manually on Kite.")
                 except Exception as e:
                     print(f"[Webhook] Exit order failed: {e}")

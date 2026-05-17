@@ -71,6 +71,27 @@ def evaluate_exit(
     macro = classify_macro(macro_raw)
     macro_regime = macro.sentiment_enum
     macro_summary = macro.summary
+
+    # Portfolio advisor integration: check if advisor has a strong EXIT recommendation
+    advisor_action = "N/A"
+    try:
+        from agents.portfolio_advisor import get_portfolio_advice_from_db
+        advice_list = get_portfolio_advice_from_db()
+        for advice in advice_list:
+            if advice.get("symbol") == symbol:
+                advisor_action = advice.get("action", "N/A")
+                if advisor_action == "EXIT":
+                    # Advisor says exit — escalate urgency
+                    return ExitDecision(
+                        action="EXIT_NOW",
+                        urgency="URGENT",
+                        rationale=f"Portfolio advisor recommends EXIT: {advice.get('rationale', '')[:300]}",
+                        exit_reason="THESIS_INVALIDATED",
+                    )
+                break
+    except Exception as e:
+        print(f"[ExitMonitor] Portfolio advisor check failed: {e}")
+
     client = get_client()
 
     # AI exit analysis
@@ -98,6 +119,7 @@ def evaluate_exit(
                 entry_rationale=entry_rationale[:400],
                 macro_regime=macro_regime,
                 macro_summary=macro_summary,
+                advisor_recommendation=advisor_action,
             )
 
             result = call_structured(

@@ -33,6 +33,10 @@ Resistance Lvls : {resistance_levels}
 Regime          : {macro_regime}
 Summary         : {macro_summary}
 
+=== PORTFOLIO ADVISOR ===
+Advisor Action  : {advisor_recommendation}
+(If advisor says EXIT — that is a strong signal to exit immediately)
+
 === DECISION REQUIRED ===
 Evaluate whether the original thesis is still intact. Consider:
 1. Has price structure changed? (trend break, failed breakout, distribution)

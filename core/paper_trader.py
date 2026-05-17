@@ -122,10 +122,23 @@ def mark_paper_positions_to_market() -> list[dict]:
                         _close_paper_trade(session, trade, price, "TAKE_PROFIT")
                         closed = True
 
-                # Time-based exit: close if position is flat (< 1% move) for 15+ days
+                # Time-based exit: use strategy-specific max_holding_days from config
                 if not closed and trade.entry_time:
+                    from core.config import settings as _cfg
+                    strategy_cfg = _cfg.strategy.get("strategies", {}).get(
+                        trade.strategy_type or "swing", {}
+                    )
+                    max_hold = strategy_cfg.get("holding_days_max", 30)
                     holding_days = (datetime.utcnow() - trade.entry_time).days
-                    if holding_days >= 15 and trade.entry_price and trade.entry_price > 0:
+
+                    # Close if held too long
+                    if holding_days >= max_hold:
+                        _close_paper_trade(session, trade, price, "MAX_HOLDING_PERIOD")
+                        closed = True
+                        print(f"[PaperTrader] MAX_HOLD: {trade.symbol} held {holding_days}d (max={max_hold}d).")
+
+                    # Close if flat (< 1% move) for 15+ days
+                    elif holding_days >= 15 and trade.entry_price and trade.entry_price > 0:
                         unrealized_pct = abs((price - trade.entry_price) / trade.entry_price * 100)
                         if unrealized_pct < 1.0:
                             _close_paper_trade(session, trade, price, "TIME_EXIT_FLAT")
