@@ -236,7 +236,6 @@ if __name__ == "__main__":
                         help="Run single scenario by number 1-6 (default: 0 = all)")
     args = parser.parse_args()
 
-    global SCENARIOS
     if args.scenario > 0:
         SCENARIOS = [SCENARIOS[args.scenario - 1]]
 
