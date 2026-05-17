@@ -45,7 +45,10 @@ STRATEGY_PARAMS = {
         "min_rr": 1.5,
         "atr_sl_mult": 2.0,
         "atr_tp_mult": 3.0,  # TP = entry + 3×ATR
-        "conviction_threshold": 65,
+        # Backtest threshold is lower than live (65) because this scorer uses
+        # only technical indicators (max ~56-61). Live mode adds LLM + fundamental
+        # scoring that pushes totals above 65. A backtest score of 40 ≈ live 65.
+        "conviction_threshold": 40,
         "risk_pct": 0.01,
     },
     "positional": {
@@ -53,7 +56,7 @@ STRATEGY_PARAMS = {
         "min_rr": 2.0,
         "atr_sl_mult": 2.5,
         "atr_tp_mult": 5.0,
-        "conviction_threshold": 72,
+        "conviction_threshold": 45,  # live=72, scaled for technical-only scorer
         "risk_pct": 0.01,
     },
 }

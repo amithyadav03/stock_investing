@@ -36,24 +36,29 @@ SYMBOLS = [
     # Pharma (defensive, works well in bear markets)
     "SUNPHARMA", "DRREDDY", "CIPLA",
     # Auto (cyclical, good swing trading)
-    "TATAMOTORS", "MARUTI",
+    "MARUTI", "BAJAJ-AUTO",
     # Energy / Conglomerate
     "RELIANCE",
     # FMCG (defensive)
     "HINDUNILVR", "ITC",
     # Metals (high beta, good for momentum)
     "TATASTEEL", "HINDALCO",
-    # Infra
-    "LT",
+    # Infra / Finance
+    "LT", "BAJFINANCE",
 ]
 
 # ── Market regime scenarios ─────────────────────────────────────────────────────
+# in_sample_months / out_of_sample_months:
+#   1-year period  → use 3m/2m (gives ~3 OOS windows)
+#   2-year period  → use 4m/2m (gives ~6 OOS windows)
+#   6-year period  → use 6m/3m (standard walk-forward)
 SCENARIOS = [
     {
         "name": "1_pre_covid_bull_correction",
         "label": "Pre-COVID Bull + Correction (2018–2019)",
         "start": "2018-01-01",
         "end":   "2019-12-31",
+        "is_months": 4, "oos_months": 2,
         "note":  "Nifty fell ~15% in late 2018, recovered in 2019. Tests: drawdown control + recovery capture.",
     },
     {
@@ -61,15 +66,17 @@ SCENARIOS = [
         "label": "COVID Crash + V-Recovery (2020)",
         "start": "2020-01-01",
         "end":   "2020-12-31",
+        "is_months": 3, "oos_months": 2,
         "note":  "Nifty -38% in 8 weeks (Feb–Mar 2020), then +80% recovery by year end. "
-                 "Ultimate stress test: does the circuit breaker protect capital in the crash? "
-                 "Does the system get back in during the recovery?",
+                 "Ultimate stress test: does circuit breaker protect capital? "
+                 "Does the system re-enter during the V-recovery?",
     },
     {
         "name": "3_post_covid_bull",
         "label": "Post-COVID Bull Run (2021)",
         "start": "2021-01-01",
         "end":   "2021-12-31",
+        "is_months": 3, "oos_months": 2,
         "note":  "Nifty +24% in 2021, strong trending. Tests: momentum capture in ideal conditions.",
     },
     {
@@ -77,6 +84,7 @@ SCENARIOS = [
         "label": "FII Selloff + Rate Hike Bear (2022)",
         "start": "2022-01-01",
         "end":   "2022-12-31",
+        "is_months": 3, "oos_months": 2,
         "note":  "Nifty volatile, mid-year correction -17% from peak. FII sold ₹1.7L cr. "
                  "Tests: how system behaves in choppy, news-driven market.",
     },
@@ -85,14 +93,16 @@ SCENARIOS = [
         "label": "Recovery + Recent Bull (2023–2024)",
         "start": "2023-01-01",
         "end":   "2024-12-31",
-        "note":  "Nifty hit all-time highs. Tests: recent performance, most relevant to forward expectations.",
+        "is_months": 4, "oos_months": 2,
+        "note":  "Nifty hit all-time highs. Most relevant to near-future performance.",
     },
     {
         "name": "6_full_period_master",
         "label": "Full Period Master Validation (2019–2024)",
         "start": "2019-01-01",
         "end":   "2024-12-31",
-        "note":  "6-year walk-forward across all regimes. This is the primary validation.",
+        "is_months": 6, "oos_months": 3,
+        "note":  "6-year walk-forward across all regimes. Primary go/no-go validation.",
     },
 ]
 
@@ -113,8 +123,8 @@ def run_all_scenarios(strategy_type: str = "swing", capital: float = 500_000):
                 end_date=s["end"],
                 strategy_type=strategy_type,
                 initial_capital=capital,
-                in_sample_months=6,
-                out_of_sample_months=3,
+                in_sample_months=s.get("is_months", 6),
+                out_of_sample_months=s.get("oos_months", 3),
                 output_dir=f"backtest/results/{s['name']}",
             )
 
