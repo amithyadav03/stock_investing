@@ -750,6 +750,7 @@ def run_backtest(
     all_trades: List[BacktestTrade] = []
     capital = initial_capital
     equity_history = [(start_dt.strftime("%Y-%m-%d"), capital)]
+    max_pos = 3  # max concurrent positions; capital sized per this, not per symbol count
 
     for w_idx, (_, test_start, test_end) in enumerate(windows):
         print(f"[Backtest] Window {w_idx+1}/{len(windows)}: {test_start.strftime('%Y-%m-%d')} -> {test_end.strftime('%Y-%m-%d')}")
@@ -764,14 +765,13 @@ def run_backtest(
                 test_start=test_start,
                 test_end=test_end,
                 strategy_type=strategy_type,
-                initial_capital=capital / len(symbols),  # Allocate equally per symbol
+                initial_capital=capital / max_pos,  # size each symbol slot as 1/max_pos of capital
             )
             window_trades.extend(trades)
 
         # Apply max open positions limit: sort by date, cap concurrent positions
         window_trades.sort(key=lambda t: t.entry_date)
         filtered_trades = []
-        max_pos = 3  # Use 3 max concurrent positions per window
 
         for t in window_trades:
             # Simple concurrent position limit
@@ -813,11 +813,21 @@ def run_backtest(
     avg_hold = round(sum(t.holding_days for t in all_trades) / len(all_trades), 1)
     total_return = round((capital - initial_capital) / initial_capital * 100, 2)
 
-    # Equity curve for Sharpe
-    equity_series = pd.Series(
-        [e[1] for e in equity_history],
-        index=pd.to_datetime([e[0] for e in equity_history])
-    )
+    # Build daily equity series from trade exit dates for accurate Sharpe/drawdown.
+    # Using quarterly equity snapshots (one per OOS window) gives too few observations
+    # and blows up Sharpe when variance is near-zero across sparse checkpoints.
+    trade_pnl_by_date: dict = {}
+    for t in all_trades:
+        trade_pnl_by_date[t.exit_date] = trade_pnl_by_date.get(t.exit_date, 0.0) + t.net_pnl
+
+    bdays = pd.bdate_range(start=start_date, end=end_date)
+    cap_running = initial_capital
+    daily_caps = []
+    for d in bdays:
+        cap_running += trade_pnl_by_date.get(d.strftime("%Y-%m-%d"), 0.0)
+        daily_caps.append(cap_running)
+
+    equity_series = pd.Series(daily_caps, index=bdays)
     daily_returns = equity_series.pct_change().dropna()
     sharpe = _compute_sharpe(daily_returns)
     max_dd = _compute_max_drawdown(equity_series)
