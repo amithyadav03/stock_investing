@@ -17,7 +17,8 @@ def auto_scan_market():
     symbols_to_scan = []
     if os.path.exists(json_path):
         with open(json_path, 'r') as f:
-            symbols_to_scan = json.load(f)
+            data = json.load(f)
+            symbols_to_scan = data if isinstance(data, list) else data.get("symbols", [])
             print(f"Loaded {len(symbols_to_scan)} symbols dynamically from Tier-1 Screener.")
     else:
         # Fallback to YAML if the pre_screener hasn't run

@@ -76,6 +76,18 @@ class MarketDataTool:
         if df.empty or len(df) < 50:
             return {"error": f"Insufficient data for {symbol}."}
 
+        # Validate OHLC integrity
+        invalid = (df['High'] < df['Low']).sum() + (df['Close'] < 0).sum()
+        if invalid > 5:
+            return {"error": f"Data integrity failure for {symbol}: {invalid} bad bars."}
+
+        # Detect gaps (missing trading days > 5 in a row = suspicious)
+        if hasattr(df.index, 'to_series'):
+            date_diffs = df.index.to_series().diff().dt.days.dropna()
+            max_gap = date_diffs.max() if len(date_diffs) > 0 else 0
+            if max_gap > 7:
+                print(f"[MarketData] Warning: {symbol} has {max_gap}-day gap in data.")
+
         # ── Indicators ─────────────────────────────────────────────────────────
         df = add_all_indicators(df)
 
@@ -84,18 +96,10 @@ class MarketDataTool:
         df_w['sma20'] = df_w['Close'].rolling(20).mean()
         weekly_trend = "UP" if df_w['Close'].iloc[-1] > df_w['sma20'].iloc[-1] else "DOWN"
 
-        # ── Support / Resistance (2-year rolling min/max) ───────────────────────
-        df['min_20'] = df['Low'].rolling(20, center=True).min()
-        df['max_20'] = df['High'].rolling(20, center=True).max()
-        price = df['Close'].iloc[-1]
-        support_levels = sorted(
-            [round(x, 2) for x in df[df['Low'] == df['min_20']]['Low'].unique()
-             if 0.8 * price <= x < price], reverse=True
-        )[:3]
-        resistance_levels = sorted(
-            [round(x, 2) for x in df[df['High'] == df['max_20']]['High'].unique()
-             if price < x <= 1.2 * price]
-        )[:3]
+        # ── Support / Resistance using pivot points ────────────────────────────
+        from tools.indicators import pivot_support_resistance
+        price = float(df['Close'].iloc[-1])
+        support_levels, resistance_levels = pivot_support_resistance(df, n_pivots=3)
 
         # ── Relative strength vs NIFTY 50 (30-day) ─────────────────────────────
         try:
@@ -144,6 +148,23 @@ class MarketDataTool:
         latest = df.iloc[-1]
         avg_vol_30 = float(df['Volume'].tail(30).mean())
 
+        # VWAP (last 20 days rolling)
+        vwap_val = round(float(df['VWAP'].iloc[-1]), 2) if 'VWAP' in df.columns else 0.0
+        vwap_dev = round(float(df['VWAP_DEV'].iloc[-1]), 2) if 'VWAP_DEV' in df.columns else 0.0
+
+        # OBV trend (is OBV rising? Compare last 10 vs 20 bars back)
+        obv_series = df['OBV'] if 'OBV' in df.columns else pd.Series(dtype=float)
+        obv_trend = "RISING" if len(obv_series) >= 20 and float(obv_series.iloc[-1]) > float(obv_series.iloc[-20]) else "FALLING"
+
+        # Divergence signals
+        from tools.indicators import detect_rsi_divergence, detect_macd_divergence, momentum_6m, momentum_12m
+        rsi_div = detect_rsi_divergence(df, lookback=20)
+        macd_div = detect_macd_divergence(df, lookback=20)
+
+        # Momentum factors (risk-adjusted)
+        mom_6m = momentum_6m(df)
+        mom_12m = momentum_12m(df)
+
         def _get(col_prefix: str, default=0.0):
             col = next((c for c in df.columns if c.startswith(col_prefix)), None)
             return round(float(latest[col]), 4) if col else default
@@ -179,6 +200,13 @@ class MarketDataTool:
             "ema_50": ema50,
             "ema_200": ema200,
             "average_volume_30d": avg_vol_30,
+            "vwap": vwap_val,
+            "vwap_deviation_pct": vwap_dev,
+            "obv_trend": obv_trend,
+            "rsi_divergence": rsi_div,
+            "macd_divergence": macd_div,
+            "momentum_6m": mom_6m,
+            "momentum_12m": mom_12m,
             "relative_strength_30d": rs_score,
             "weekly_trend": weekly_trend,
             "support_levels": support_levels,
@@ -226,12 +254,12 @@ class MarketDataTool:
 
         df = df.dropna()
         # EMA calculations on weekly
-        df['EMA_10w'] = df['Close'].ewm(span=10, adjust=False).mean()
-        df['EMA_30w'] = df['Close'].ewm(span=30, adjust=False).mean()
+        df['EMA_20w'] = df['Close'].ewm(span=20, adjust=False).mean()
+        df['EMA_50w'] = df['Close'].ewm(span=50, adjust=False).mean()
 
         price = float(df['Close'].iloc[-1])
-        ema10 = float(df['EMA_10w'].iloc[-1])
-        ema30 = float(df['EMA_30w'].iloc[-1])
+        ema20 = float(df['EMA_20w'].iloc[-1])
+        ema50 = float(df['EMA_50w'].iloc[-1])
 
         # Weekly RSI
         delta = df['Close'].diff()
@@ -241,9 +269,9 @@ class MarketDataTool:
         weekly_rsi = float(100 - 100 / (1 + rs.iloc[-1]))
 
         # Trend: price above both EMAs on weekly = strong uptrend
-        weekly_structure = "STRONG_UP" if price > ema10 > ema30 else \
-                           "UP" if price > ema30 else \
-                           "DOWN" if price < ema30 else "SIDEWAYS"
+        weekly_structure = "STRONG_UP" if price > ema20 > ema50 else \
+                           "UP" if price > ema50 else \
+                           "DOWN" if price < ema50 else "SIDEWAYS"
 
         # 52-week high/low
         high_52w = float(df['High'].tail(52).max())
@@ -253,8 +281,8 @@ class MarketDataTool:
         result = {
             "symbol": symbol,
             "weekly_price": round(price, 2),
-            "weekly_ema_10": round(ema10, 2),
-            "weekly_ema_30": round(ema30, 2),
+            "weekly_ema_20": round(ema20, 2),
+            "weekly_ema_50": round(ema50, 2),
             "weekly_rsi": round(weekly_rsi, 1),
             "weekly_structure": weekly_structure,
             "high_52w": round(high_52w, 2),
@@ -288,9 +316,11 @@ class MarketDataTool:
         ema12 = float(df['EMA_12m'].iloc[-1])
         ema24 = float(df['EMA_24m'].iloc[-1])
 
-        # Monthly momentum: 3-month and 12-month returns
+        # Monthly momentum: 3-month, 6-month, 12-month, and 24-month returns
         ret_3m = round((price - float(df['Close'].iloc[-3])) / float(df['Close'].iloc[-3]) * 100, 2) if len(df) >= 3 else 0.0
         ret_12m = round((price - float(df['Close'].iloc[-12])) / float(df['Close'].iloc[-12]) * 100, 2) if len(df) >= 12 else 0.0
+        ret_6m = round((price - float(df['Close'].iloc[-6])) / float(df['Close'].iloc[-6]) * 100, 2) if len(df) >= 6 else 0.0
+        ret_24m = round((price - float(df['Close'].iloc[-24])) / float(df['Close'].iloc[-24]) * 100, 2) if len(df) >= 24 else 0.0
 
         monthly_trend = "UP" if price > ema12 > ema24 else "DOWN" if price < ema24 else "NEUTRAL"
 
@@ -301,7 +331,9 @@ class MarketDataTool:
             "monthly_ema_24": round(ema24, 2),
             "monthly_trend": monthly_trend,
             "return_3m_pct": ret_3m,
+            "return_6m_pct": ret_6m,
             "return_12m_pct": ret_12m,
+            "return_24m_pct": ret_24m,
         }
         cache.set(cache_key, result, TTL_TECHNICALS)
         return result

@@ -72,6 +72,17 @@ FUNDAMENTAL DATA:
 - Promoter Holding: {fundamental_data.get('promoter_holding', 'N/A')}%
 - Revenue Growth: {fundamental_data.get('revenue_growth', 'N/A')}%
 - Profit Growth: {fundamental_data.get('profit_growth', 'N/A')}%
+- Quality Score: {fundamental_data.get('quality_score', 'N/A')}/100
+- Promoter Pledge: {fundamental_data.get('promoter_pledge', 'N/A')}
+- Book Value: {fundamental_data.get('book_value', 'N/A')}
+- EPS Growth: {fundamental_data.get('eps_growth', 'N/A')}
+- Revenue Growth: {fundamental_data.get('revenue_growth', 'N/A')}%
+- VWAP Deviation: {technical_data.get('vwap_deviation_pct', 'N/A')}%
+- OBV Trend: {technical_data.get('obv_trend', 'N/A')}
+- RSI Divergence: {technical_data.get('rsi_divergence', 'N/A')}
+- MACD Divergence: {technical_data.get('macd_divergence', 'N/A')}
+- 6M Momentum: {technical_data.get('momentum_6m', 'N/A')}
+- 12M Momentum: {technical_data.get('momentum_12m', 'N/A')}
 
 SENTIMENT:
 - Label: {sentiment_data.get('label', 'NEUTRAL')}
@@ -117,9 +128,12 @@ Score each dimension and total. Be precise — do not round to 50s and 70s refle
             research = int(result.get("research_quality_score", 0))
             total = tech + fund + macro + research
 
-            # Macro bearish penalty
-            if macro_sentiment == "BEARISH" and total > threshold:
-                total = int(total * macro_risk_multiplier)
+            # Macro adjustment
+            if macro_sentiment == "BEARISH":
+                penalized = int(total * 0.88)  # Soft penalty: reduce ~12%, don't kill the trade
+                total = penalized
+            elif macro_sentiment == "BULLISH":
+                total = min(100, int(total * 1.05))  # Small bullish boost, capped at 100
 
             tier = "HIGH" if total >= 80 else "MEDIUM" if total >= 65 else "LOW"
             return ConvictionScore(
@@ -177,7 +191,21 @@ def _rule_based_score(
     if promoter > 50: fund += 6
     fund = min(fund, 30)
 
-    macro = {"BULLISH": 16, "NEUTRAL": 12, "BEARISH": 6}.get(macro_sentiment, 12)
+    # Bonus from quality score
+    quality = fundamental_data.get("quality_score", 0) or 0
+    if quality > 70: fund = min(fund + 4, 30)
+    elif quality > 50: fund = min(fund + 2, 30)
+
+    # Promoter pledge penalty
+    pledge_str = fundamental_data.get("promoter_pledge", "N/A")
+    if pledge_str and pledge_str != "N/A":
+        try:
+            pledge_val = float(str(pledge_str).replace('%', '').strip())
+            if pledge_val > 30: fund = max(0, fund - 5)
+        except (ValueError, TypeError):
+            pass
+
+    macro = {"BULLISH": 17, "NEUTRAL": 13, "BEARISH": 9}.get(macro_sentiment, 13)
 
     research = min(int(research_score * 0.2), 20)
     total = tech + fund + macro + research

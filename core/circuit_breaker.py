@@ -49,6 +49,25 @@ class CircuitBreaker:
             if open_count >= max_open_pos:
                 return False, f"CIRCUIT BREAKER: {open_count} positions open (max {max_open_pos}). No new entries."
 
+            # 4. Peak-to-trough drawdown check
+            max_drawdown = risk_cfg.get("max_drawdown_from_peak_pct", 0.15)  # 15%
+            try:
+                from db.schema import PerformanceLog, PaperTrade
+                from core.config import settings as _s
+                if _s.PAPER_MODE:
+                    # Compute peak equity from PerformanceLog
+                    logs = session.query(PerformanceLog).order_by(PerformanceLog.date).all()
+                    if logs:
+                        # Peak equity = total_capital + max cumulative unrealized + realized
+                        peak = max((l.total_capital + (l.unrealized_pnl or 0) for l in logs), default=0)
+                        latest_log = logs[-1]
+                        current_equity = latest_log.total_capital + (latest_log.unrealized_pnl or 0)
+                        if peak > 0 and (peak - current_equity) / peak >= max_drawdown:
+                            self._log(session, f"Peak drawdown breached: {(peak - current_equity)/peak:.1%}", None, None)
+                            return False, f"CIRCUIT BREAKER: Drawdown {(peak-current_equity)/peak:.1%} from peak. Review required."
+            except Exception as e:
+                print(f"[CircuitBreaker] Drawdown check failed: {e}")
+
             return True, "OK"
         finally:
             session.close()

@@ -68,9 +68,12 @@ risk:
   max_liquidity_percent_of_volume: 0.01
   min_sl_atr_multiplier: 0.5
 
-  max_daily_loss_pct: 0.03
+  max_daily_loss_pct: 0.02
   max_consecutive_losses: 3
   max_open_positions: 5
+  max_drawdown_from_peak_pct: 0.15     # halt if equity drops 15% from all-time high
+  max_positions_per_sector: 2           # prevent sector concentration
+  transaction_cost_pct: 0.004          # 0.4% round-trip (STT + brokerage + fees)
 
 # ── Exit Management ────────────────────────────────────────────────────────────
 exit:

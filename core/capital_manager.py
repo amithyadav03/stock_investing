@@ -7,6 +7,36 @@ from core.config import settings
 from db.schema import SessionLocal, TradeExecution, PaperTrade
 
 
+SECTOR_MAP = {
+    # Banking & Finance
+    "HDFCBANK": "BANKING", "ICICIBANK": "BANKING", "SBIN": "BANKING",
+    "AXISBANK": "BANKING", "KOTAKBANK": "BANKING", "BAJFINANCE": "BANKING",
+    "BAJAJFINSV": "BANKING", "HDFCLIFE": "BANKING", "SBILIFE": "BANKING",
+    # IT
+    "INFY": "IT", "TCS": "IT", "WIPRO": "IT", "HCLTECH": "IT",
+    "TECHM": "IT", "MPHASIS": "IT", "LTIM": "IT", "PERSISTENT": "IT",
+    # Pharma
+    "SUNPHARMA": "PHARMA", "DRREDDY": "PHARMA", "CIPLA": "PHARMA",
+    "DIVISLAB": "PHARMA", "AUROPHARMA": "PHARMA", "TORNTPHARM": "PHARMA",
+    # Auto
+    "TATAMOTORS": "AUTO", "MARUTI": "AUTO", "BAJAJ-AUTO": "AUTO",
+    "HEROMOTOCO": "AUTO", "EICHERMOT": "AUTO", "M&M": "AUTO",
+    # Energy & Oil
+    "RELIANCE": "ENERGY", "ONGC": "ENERGY", "BPCL": "ENERGY",
+    "IOC": "ENERGY", "NTPC": "ENERGY", "POWERGRID": "ENERGY",
+    # FMCG
+    "HINDUNILVR": "FMCG", "ITC": "FMCG", "NESTLEIND": "FMCG",
+    "BRITANNIA": "FMCG", "DABUR": "FMCG", "MARICO": "FMCG",
+    # Metals
+    "TATASTEEL": "METALS", "JSWSTEEL": "METALS", "HINDALCO": "METALS",
+    "VEDL": "METALS", "NMDC": "METALS", "SAIL": "METALS",
+    # Telecom
+    "BHARTIARTL": "TELECOM", "IDEA": "TELECOM",
+    # Infrastructure / Capital Goods
+    "LT": "INFRA", "SIEMENS": "INFRA", "ABB": "INFRA",
+}
+
+
 class CapitalManager:
 
     def get_total_capital(self) -> float:
@@ -64,8 +94,11 @@ class CapitalManager:
         finally:
             session.close()
 
-    def can_open_new_position(self, strategy_type: str = "swing") -> tuple[bool, str]:
-        """Returns (allowed, reason). Checks position count, capital, and portfolio heat."""
+    def get_sector(self, symbol: str) -> str:
+        return SECTOR_MAP.get(symbol.upper(), "OTHER")
+
+    def can_open_new_position(self, strategy_type: str = "swing", symbol: str = "") -> tuple[bool, str]:
+        """Returns (allowed, reason). Checks position count, capital, portfolio heat, and sector concentration."""
         max_pos = settings.strategy.get("risk", {}).get("max_open_positions", 5)
         count = self.get_open_position_count()
         if count >= max_pos:
@@ -88,6 +121,28 @@ class CapitalManager:
 
         if strategy_count >= strategy_max:
             return False, f"Max {strategy_max} {strategy_type} positions reached."
+
+        # Per-sector concentration cap
+        sector_max = settings.strategy.get("risk", {}).get("max_positions_per_sector", 2)
+        symbol_sector = self.get_sector(symbol)
+        if symbol_sector != "OTHER":
+            session2 = SessionLocal()
+            try:
+                sector_symbols = [s for s, sec in SECTOR_MAP.items() if sec == symbol_sector]
+                if settings.PAPER_MODE:
+                    sector_count = session2.query(PaperTrade).filter(
+                        PaperTrade.status == "OPEN",
+                        PaperTrade.symbol.in_(sector_symbols)
+                    ).count()
+                else:
+                    sector_count = session2.query(TradeExecution).filter(
+                        TradeExecution.status == "OPEN",
+                        TradeExecution.symbol.in_(sector_symbols)
+                    ).count()
+                if sector_count >= sector_max:
+                    return False, f"Sector concentration limit: already {sector_count} {symbol_sector} positions."
+            finally:
+                session2.close()
 
         available = self.get_available_capital()
         if available < settings.strategy.get("capital", {}).get("min_available_capital", 10000):

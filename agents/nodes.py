@@ -314,10 +314,10 @@ def risk_manager_node(state: AgentState) -> dict:
             warnings.append("CRITICAL: Stop loss >= entry (hallucination guard).")
         if atr > 0:
             min_sl = decision.proposed_entry - (atr * min_sl_atr)
-            if decision.proposed_stop_loss > min_sl:
+            if decision.proposed_stop_loss < min_sl:
                 is_safe = False
                 warnings.append(
-                    f"CRITICAL: SL {decision.proposed_stop_loss:.2f} too tight. "
+                    f"CRITICAL: SL {decision.proposed_stop_loss:.2f} too tight — breaches minimum buffer. "
                     f"Min safe SL = {min_sl:.2f} ({min_sl_atr}xATR)."
                 )
         rr = 0.0
@@ -332,6 +332,27 @@ def risk_manager_node(state: AgentState) -> dict:
             is_safe = False
             warnings.append(f"CRITICAL: Only {confluence}/3 timeframes aligned for positional trade.")
 
+    elif decision.proposed_action == "SELL":
+        if decision.proposed_stop_loss <= decision.proposed_entry:
+            is_safe = False
+            warnings.append("CRITICAL: Stop loss <= entry for SELL (hallucination guard).")
+        if atr > 0:
+            max_sl = decision.proposed_entry + (atr * min_sl_atr)
+            if decision.proposed_stop_loss < max_sl:
+                is_safe = False
+                warnings.append(
+                    f"CRITICAL: SL {decision.proposed_stop_loss:.2f} too tight for SELL. "
+                    f"Min safe SL = {max_sl:.2f} ({min_sl_atr}xATR above entry)."
+                )
+        rr = 0.0
+        if decision.proposed_entry > decision.proposed_take_profit > 0:
+            risk_pts = decision.proposed_stop_loss - decision.proposed_entry
+            reward_pts = decision.proposed_entry - decision.proposed_take_profit
+            rr = reward_pts / risk_pts if risk_pts > 0 else 0
+        if rr < min_rr:
+            is_safe = False
+            warnings.append(f"CRITICAL: R:R {rr:.1f} below minimum {min_rr} for SELL.")
+
     risk_per_tier = {
         "HIGH":   strategy_cfg.get("risk_per_trade", 0.01),
         "MEDIUM": strategy_cfg.get("risk_per_trade", 0.01) * 0.75,
@@ -340,6 +361,12 @@ def risk_manager_node(state: AgentState) -> dict:
     if decision.proposed_action in ("BUY", "SELL"):
         tier = (decision.conviction_tier or "LOW").upper()
         decision.risk_percentage = risk_per_tier.get(tier, 0.005)
+
+    # Enforce max holding days per strategy
+    max_hold = settings.strategy.get("exit", {}).get(f"max_holding_days_{strategy_type}", 30)
+    if decision.expected_holding_days > max_hold:
+        warnings.append(f"WARNING: Holding days {decision.expected_holding_days} exceeds strategy max {max_hold}d. Capping.")
+        decision.expected_holding_days = max_hold
 
     if decision.risk_percentage > max_abs_risk:
         is_safe = False

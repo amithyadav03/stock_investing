@@ -25,73 +25,267 @@ class FundamentalNewsTool:
         self.rss_feeds = settings.strategy.get("news", {}).get("rss_feeds", [])
 
     def get_comparative_fundamentals(self, symbol: str) -> Dict[str, Any]:
-        """Scrapes Screener.in for key Indian metrics. Falls back to yfinance."""
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-        url = f"https://www.screener.in/company/{symbol}/consolidated/"
+        """
+        Fetches fundamentals with Screener.in as primary, yfinance as fallback.
+        Results cached 24h in TTL cache. Returns standardized numeric fields where possible.
+        """
+        from core.cache import cache, TTL_FUNDAMENTALS
+
+        cache_key = f"fundamentals_{symbol}"
+        cached = cache.get(cache_key)
+        if cached:
+            return cached
+
+        result = self._fetch_screener(symbol)
+        if result.get("error"):
+            result = self._fetch_yfinance(symbol)
+
+        # Compute quality score
+        result["quality_score"] = self._compute_quality_score(result)
+
+        cache.set(cache_key, result, TTL_FUNDAMENTALS)
+        return result
+
+    def _safe_float(self, val, default=None):
+        """Convert string/number to float, return default on failure."""
+        if val is None or val == "N/A" or val == "":
+            return default
         try:
-            resp = requests.get(url, headers=headers, timeout=5)
-            if resp.status_code == 200:
-                soup = BeautifulSoup(resp.text, 'html.parser')
-                ratios: dict = {}
-                ratios_ul = soup.find('ul', id='top-ratios')
-                if ratios_ul:
-                    for li in ratios_ul.find_all('li'):
-                        name_el = li.find('span', class_='name')
-                        val_el = li.find('span', class_='number')
-                        if name_el and val_el:
-                            ratios[name_el.text.strip()] = val_el.text.strip()
+            return float(str(val).replace(',', '').replace('%', '').strip())
+        except (ValueError, TypeError):
+            return default
 
-                # Revenue / profit growth (quarterly)
-                growth_pct = "N/A"
+    def _fetch_screener(self, symbol: str) -> Dict[str, Any]:
+        """Scrapes Screener.in with retries and structured extraction."""
+        import time
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                          '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Referer': 'https://www.screener.in',
+        }
+
+        urls_to_try = [
+            f"https://www.screener.in/company/{symbol}/consolidated/",
+            f"https://www.screener.in/company/{symbol}/",
+        ]
+
+        for url in urls_to_try:
+            for attempt in range(3):
                 try:
-                    profit_table = soup.find('table', id='quarters')
-                    if profit_table:
-                        rows = profit_table.find_all('tr')
-                        for row in rows:
-                            cells = row.find_all('td')
-                            if cells and 'Net Profit' in cells[0].text:
-                                vals = [c.text.strip().replace(',', '') for c in cells[1:] if c.text.strip()]
-                                if len(vals) >= 2:
-                                    try:
-                                        prev, curr = float(vals[-2]), float(vals[-1])
-                                        if prev != 0:
-                                            growth_pct = f"{round((curr - prev) / abs(prev) * 100, 1)}%"
-                                    except ValueError:
-                                        pass
-                                break
-                except Exception:
-                    pass
+                    resp = requests.get(url, headers=headers, timeout=10)
+                    if resp.status_code == 200:
+                        return self._parse_screener_html(resp.text, symbol)
+                    elif resp.status_code == 404:
+                        break  # Symbol not found, try other URL
+                    elif resp.status_code == 429:
+                        time.sleep(2 ** attempt)  # Rate limited
+                        continue
+                except requests.exceptions.Timeout:
+                    if attempt < 2:
+                        time.sleep(1)
+                    continue
+                except Exception as e:
+                    print(f"[Fundamentals] Screener fetch failed for {symbol}: {e}")
+                    break
 
-                return {
-                    "source": "screener.in",
-                    "symbol": symbol,
-                    "pe_ratio": ratios.get("Stock P/E", "N/A"),
-                    "roe": ratios.get("ROE", "N/A"),
-                    "roce": ratios.get("ROCE", "N/A"),
-                    "debt_to_equity": ratios.get("Debt to equity", "N/A"),
-                    "promoter_holding": ratios.get("Promoter holding", "N/A"),
-                    "market_cap": ratios.get("Market Cap", "N/A"),
-                    "dividend_yield": ratios.get("Dividend Yield", "N/A"),
-                    "profit_growth_qoq": growth_pct,
-                }
-        except Exception as e:
-            print(f"[Fundamentals] Screener failed for {symbol}: {e}. Using yfinance.")
+        return {"error": f"Screener unavailable for {symbol}", "symbol": symbol, "source": "none"}
 
+    def _parse_screener_html(self, html: str, symbol: str) -> Dict[str, Any]:
+        """Extract all relevant ratios from Screener.in HTML."""
+        soup = BeautifulSoup(html, 'html.parser')
+        ratios: dict = {}
+
+        # Extract top ratios section
+        ratios_ul = soup.find('ul', id='top-ratios')
+        if ratios_ul:
+            for li in ratios_ul.find_all('li'):
+                name_el = li.find('span', class_='name')
+                val_el = li.find('span', class_='number')
+                if name_el and val_el:
+                    ratios[name_el.text.strip()] = val_el.text.strip()
+
+        # Extract profit growth from quarterly table
+        profit_growth_qoq = "N/A"
+        revenue_growth_qoq = "N/A"
+        profit_growth_annual = "N/A"
+        try:
+            for table_id in ['quarters', 'profit-loss']:
+                profit_table = soup.find('table', id=table_id)
+                if not profit_table:
+                    continue
+                rows = profit_table.find_all('tr')
+                for row in rows:
+                    cells = row.find_all('td')
+                    if not cells:
+                        continue
+                    row_text = cells[0].text.strip().lower()
+                    vals = []
+                    for c in cells[1:]:
+                        t = c.text.strip().replace(',', '')
+                        if t and t != '':
+                            try:
+                                vals.append(float(t))
+                            except ValueError:
+                                pass
+                    if len(vals) >= 2:
+                        prev, curr = vals[-2], vals[-1]
+                        if prev != 0:
+                            growth = round((curr - prev) / abs(prev) * 100, 1)
+                            if 'net profit' in row_text or 'profit' in row_text:
+                                if table_id == 'quarters':
+                                    profit_growth_qoq = f"{growth}%"
+                                else:
+                                    profit_growth_annual = f"{growth}%"
+                            elif 'revenue' in row_text or 'sales' in row_text:
+                                revenue_growth_qoq = f"{growth}%"
+        except Exception:
+            pass
+
+        # Extract EPS if available
+        eps_growth = "N/A"
+        try:
+            for row in soup.find_all('tr'):
+                cells = row.find_all('td')
+                if cells and 'eps' in cells[0].text.lower():
+                    vals = [c.text.strip().replace(',', '') for c in cells[1:] if c.text.strip()]
+                    if len(vals) >= 2:
+                        try:
+                            prev, curr = float(vals[-2]), float(vals[-1])
+                            if prev != 0:
+                                eps_growth = f"{round((curr - prev) / abs(prev) * 100, 1)}%"
+                        except ValueError:
+                            pass
+                    break
+        except Exception:
+            pass
+
+        # Promoter pledge (look in shareholding section)
+        promoter_pledge = "N/A"
+        try:
+            pledge_text = soup.find(string=lambda t: t and 'pledge' in t.lower())
+            if pledge_text:
+                parent = pledge_text.find_parent('td')
+                if parent and parent.find_next_sibling('td'):
+                    promoter_pledge = parent.find_next_sibling('td').text.strip()
+        except Exception:
+            pass
+
+        return {
+            "source": "screener.in",
+            "symbol": symbol,
+            "pe_ratio": self._safe_float(ratios.get("Stock P/E") or ratios.get("P/E")),
+            "roe": self._safe_float(ratios.get("ROE")),
+            "roce": self._safe_float(ratios.get("ROCE")),
+            "debt_to_equity": self._safe_float(ratios.get("Debt to equity") or ratios.get("Debt / Equity")),
+            "promoter_holding": self._safe_float(ratios.get("Promoter holding")),
+            "promoter_pledge": promoter_pledge,
+            "market_cap": ratios.get("Market Cap", "N/A"),
+            "dividend_yield": self._safe_float(ratios.get("Dividend Yield")),
+            "book_value": self._safe_float(ratios.get("Book Value")),
+            "current_ratio": self._safe_float(ratios.get("Current ratio") or ratios.get("Current Ratio")),
+            "profit_growth_qoq": profit_growth_qoq,
+            "profit_growth_annual": profit_growth_annual,
+            "revenue_growth": revenue_growth_qoq,
+            "eps_growth": eps_growth,
+        }
+
+    def _fetch_yfinance(self, symbol: str) -> Dict[str, Any]:
+        """yfinance fallback — returns standardized dict with numeric fields."""
         try:
             info = yf.Ticker(f"{symbol}.NS").info
+            roe_raw = info.get("returnOnEquity")
+            roce_raw = info.get("returnOnAssets")  # yfinance doesn't have ROCE; ROA as proxy
+
             return {
                 "source": "yfinance",
                 "symbol": symbol,
-                "pe_ratio": info.get("trailingPE", "N/A"),
-                "roe": info.get("returnOnEquity", "N/A"),
-                "debt_to_equity": info.get("debtToEquity", "N/A"),
-                "market_cap": info.get("marketCap", "N/A"),
-                "dividend_yield": info.get("dividendYield", "N/A"),
-                "revenue_growth": info.get("revenueGrowth", "N/A"),
-                "earnings_growth": info.get("earningsGrowth", "N/A"),
+                "pe_ratio": self._safe_float(info.get("trailingPE") or info.get("forwardPE")),
+                "roe": round(float(roe_raw) * 100, 2) if roe_raw else None,
+                "roce": round(float(roce_raw) * 100, 2) if roce_raw else None,
+                "debt_to_equity": self._safe_float(info.get("debtToEquity")),
+                "promoter_holding": None,
+                "promoter_pledge": "N/A",
+                "market_cap": info.get("marketCap"),
+                "dividend_yield": self._safe_float(info.get("dividendYield")),
+                "book_value": self._safe_float(info.get("bookValue")),
+                "current_ratio": self._safe_float(info.get("currentRatio")),
+                "profit_growth_qoq": "N/A",
+                "profit_growth_annual": "N/A",
+                "revenue_growth": self._safe_float(info.get("revenueGrowth")),
+                "eps_growth": self._safe_float(info.get("earningsGrowth")),
             }
-        except Exception:
-            return {"error": "Could not fetch fundamentals.", "symbol": symbol}
+        except Exception as e:
+            return {"error": f"yfinance also failed: {e}", "symbol": symbol, "source": "none"}
+
+    def _compute_quality_score(self, data: dict) -> int:
+        """
+        Computes a 0-100 quality score based on fundamentals.
+        Empirically validated factors for Indian equities:
+        - ROCE > 15% (strong moat)
+        - ROE > 15% (efficient equity use)
+        - Debt/Equity < 0.5 (low leverage)
+        - Promoter holding > 50% (skin in the game)
+        - Low promoter pledge (governance risk)
+        - Positive revenue and profit growth
+        """
+        score = 0
+
+        roe = self._safe_float(data.get("roe"), 0)
+        roce = self._safe_float(data.get("roce"), 0)
+        de = self._safe_float(data.get("debt_to_equity"), 99)
+        promoter = self._safe_float(data.get("promoter_holding"), 0)
+        pledge = data.get("promoter_pledge", "N/A")
+        rev_growth = data.get("revenue_growth", "N/A")
+        profit_growth = data.get("profit_growth_qoq", "N/A")
+        cr = self._safe_float(data.get("current_ratio"), 1)
+
+        # ROCE scoring (0-25 pts) - most important for Indian equities
+        if roce and roce >= 20: score += 25
+        elif roce and roce >= 15: score += 20
+        elif roce and roce >= 10: score += 12
+        elif roce and roce >= 5: score += 5
+
+        # ROE scoring (0-20 pts)
+        if roe and roe >= 20: score += 20
+        elif roe and roe >= 15: score += 15
+        elif roe and roe >= 10: score += 8
+        elif roe and roe >= 5: score += 3
+
+        # Debt/Equity (0-20 pts)
+        if de is not None:
+            if de <= 0.1: score += 20
+            elif de <= 0.3: score += 16
+            elif de <= 0.5: score += 12
+            elif de <= 1.0: score += 6
+            elif de > 2.0: score -= 5  # Heavy debt penalty
+
+        # Promoter holding (0-15 pts)
+        if promoter and promoter >= 60: score += 15
+        elif promoter and promoter >= 50: score += 12
+        elif promoter and promoter >= 40: score += 7
+        elif promoter and promoter < 25: score -= 5  # Very low promoter = concern
+
+        # Promoter pledge penalty
+        if pledge != "N/A" and pledge:
+            pledge_val = self._safe_float(pledge, 0)
+            if pledge_val and pledge_val > 50: score -= 15
+            elif pledge_val and pledge_val > 30: score -= 8
+            elif pledge_val and pledge_val > 10: score -= 3
+
+        # Revenue growth (0-10 pts)
+        rev_f = self._safe_float(str(rev_growth).replace('%', ''), 0)
+        if rev_f and rev_f >= 20: score += 10
+        elif rev_f and rev_f >= 10: score += 6
+        elif rev_f and rev_f < 0: score -= 5
+
+        # Current ratio liquidity (0-5 pts)
+        if cr and cr >= 2.0: score += 5
+        elif cr and cr >= 1.5: score += 3
+        elif cr and cr < 1.0: score -= 3
+
+        return max(0, min(100, score))
 
     def fetch_live_news_snippets(self, target_keyword: str = None) -> List[str]:
         """Aggregates RSS headlines. Filters by keyword when provided."""
