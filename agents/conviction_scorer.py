@@ -40,10 +40,20 @@ def score_conviction(
         "conviction_threshold", 65
     )
 
+    # DEGRADED MODE: when screener.in is unavailable, cap max conviction to avoid
+    # trading on incomplete governance/pledge data. 64 = just below any threshold.
+    data_quality = fundamental_data.get("data_quality", "FULL")
+    degraded_cap = 64 if data_quality == "DEGRADED" else 100
+
     client = get_client()
     if not client:
-        return _rule_based_score(technical_data, fundamental_data, sentiment_data,
-                                  macro_sentiment, research_score, strategy_type, threshold)
+        result = _rule_based_score(technical_data, fundamental_data, sentiment_data,
+                                   macro_sentiment, research_score, strategy_type, threshold)
+        if degraded_cap < 100:
+            result.total = min(result.total, degraded_cap)
+            result.passes_threshold = result.total >= threshold
+            result.breakdown += " | DATA DEGRADED: score capped at 64 (screener.in unavailable)"
+        return result
 
     try:
         system_prompt = (
@@ -141,6 +151,10 @@ Score each dimension and total. Be precise — do not round to 50s and 70s refle
             if pe_penalty > 0:
                 total = max(0, total - pe_penalty)
 
+            # Degraded data cap
+            total = min(total, degraded_cap)
+            degraded_note = " | DATA DEGRADED: capped at 64" if degraded_cap < 100 else ""
+
             tier = "HIGH" if total >= 80 else "MEDIUM" if total >= 65 else "LOW"
             return ConvictionScore(
                 total=total,
@@ -148,7 +162,7 @@ Score each dimension and total. Be precise — do not round to 50s and 70s refle
                 fundamentals=fund,
                 macro_sentiment=macro,
                 research_quality=research,
-                breakdown=result.get("breakdown", "") + (f" | PE penalty: -{pe_penalty}" if pe_penalty else ""),
+                breakdown=result.get("breakdown", "") + (f" | PE penalty: -{pe_penalty}" if pe_penalty else "") + degraded_note,
                 tier=tier,
                 passes_threshold=total >= threshold,
             )
@@ -184,6 +198,23 @@ def _rule_based_score(
     elif adx > 18: tech += 4
     if macd > 0: tech += 7
     if technical_data.get("weekly_trend") == "UP": tech += 7
+
+    # Pullback-in-uptrend verification: cleanest swing entry is a controlled pullback
+    # to EMA20 within a broader uptrend — not a surge entry at the top
+    latest_price = technical_data.get("latest_price", 0) or 0
+    ema20 = technical_data.get("ema_20", 0) or 0
+    weekly_structure = technical_data.get("weekly_structure", "")
+    if weekly_structure == "PULLBACK_IN_UPTREND" and ema20 > 0:
+        price_to_ema_pct = (latest_price - ema20) / ema20 * 100 if ema20 > 0 else 999
+        if 0 <= price_to_ema_pct <= 3:
+            tech += 5   # Clean pullback to EMA20 within uptrend — highest quality entry
+        elif price_to_ema_pct > 8:
+            tech -= 4   # Extended far above EMA20 in pullback zone — lower quality
+    elif weekly_structure in ("STRONG_UP", "UP") and ema20 > 0:
+        price_to_ema_pct = (latest_price - ema20) / ema20 * 100 if ema20 > 0 else 999
+        if price_to_ema_pct > 10:
+            tech -= 3   # Chasing a surge — reduce score
+
     tech = min(tech, 30)
 
     fund = 0
@@ -204,6 +235,18 @@ def _rule_based_score(
     quality = fundamental_data.get("quality_score", 0) or 0
     if quality > 70: fund = min(fund + 4, 30)
     elif quality > 50: fund = min(fund + 2, 30)
+
+    # Quality-at-value bonus: cheap stock (PE < 0.7× sector) with strong fundamentals
+    # Only award if profitability is genuine — prevents value traps
+    pe_ratio = fundamental_data.get("pe_ratio") or 0
+    sector_pe = fundamental_data.get("sector_pe_median") or 0
+    try:
+        if pe_ratio > 0 and sector_pe > 0:
+            pe_ratio_f, sector_pe_f = float(pe_ratio), float(sector_pe)
+            if pe_ratio_f / sector_pe_f < 0.7 and roe > 12 and roce > 12:
+                fund = min(fund + 5, 30)  # Quality-at-value: genuinely cheap + profitable
+    except (ValueError, TypeError):
+        pass
 
     # Promoter pledge penalty
     pledge_str = fundamental_data.get("promoter_pledge", "N/A")

@@ -22,8 +22,8 @@ class CircuitBreaker:
         - intraday drawdown from live open positions
         """
         risk_cfg = settings.strategy.get("risk", {})
-        max_daily_loss = risk_cfg.get("max_daily_loss_pct", 0.02)
-        max_consec_losses = risk_cfg.get("max_consecutive_losses", 3)
+        max_daily_loss = risk_cfg.get("max_daily_loss_pct", 0.01)   # Tightened: 1% (was 2%)
+        max_consec_losses = risk_cfg.get("max_consecutive_losses", 2)  # Tightened: 2 (was 3)
         max_open_pos = risk_cfg.get("max_open_positions", 5)
 
         session = SessionLocal()
@@ -76,6 +76,8 @@ class CircuitBreaker:
                 print(f"[CircuitBreaker] Drawdown check failed: {e}")
 
             # 5. Intraday drawdown — compute real-time unrealized P&L on open positions
+            # Hard halt at -3% intraday unrealized (tighter than daily realized -1% limit,
+            # because intraday gaps can accelerate to much larger losses before EOD)
             try:
                 from tools.market_data import market_data_tool
                 from core.capital_manager import capital_manager
@@ -90,10 +92,12 @@ class CircuitBreaker:
                                 intraday_loss += (current_px - t.entry_price) * (t.quantity or 0)
                             else:
                                 intraday_loss += (t.entry_price - current_px) * (t.quantity or 0)
-                # If unrealized loss > 3% of total capital, soft warn (not halt)
                 intraday_loss_pct = intraday_loss / total_cap * 100 if total_cap > 0 else 0
                 if intraday_loss_pct < -3.0:
-                    print(f"[CircuitBreaker] WARNING: Intraday unrealized loss {intraday_loss_pct:.2f}% — monitor closely.")
+                    self._log(session, f"Intraday unrealized loss {intraday_loss_pct:.2f}% (hard halt at -3%)", intraday_loss_pct, None)
+                    return False, f"CIRCUIT BREAKER: Intraday unrealized loss {intraday_loss_pct:.2f}% — halting new entries."
+                elif intraday_loss_pct < -1.5:
+                    print(f"[CircuitBreaker] WARNING: Intraday unrealized loss {intraday_loss_pct:.2f}% — approaching halt.")
             except Exception as e:
                 print(f"[CircuitBreaker] Intraday drawdown check failed: {e}")
 

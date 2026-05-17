@@ -90,12 +90,21 @@ def send_telegram_trade_proposal(
 
     msg += "\n_Approve before 9:00 AM for AMO execution tomorrow._"
 
+    # G27: Two-row keyboard — primary actions on row 1, edit/adjust on row 2
     reply_markup = {
-        "inline_keyboard": [[
-            {"text": "✅ Approve AMO",   "callback_data": f"APPROVE_{proposal_id}"},
-            {"text": "❌ Reject",        "callback_data": f"REJECT_{proposal_id}"},
-            {"text": "🔍 Research",      "callback_data": f"RESEARCH_{proposal_id}"},
-        ]]
+        "inline_keyboard": [
+            [
+                {"text": "✅ Approve AMO",   "callback_data": f"APPROVE_{proposal_id}"},
+                {"text": "❌ Reject",        "callback_data": f"REJECT_{proposal_id}"},
+                {"text": "🔍 Research",      "callback_data": f"RESEARCH_{proposal_id}"},
+            ],
+            [
+                {"text": "✏️ Entry -1%",  "callback_data": f"EDITENTRY_{proposal_id}_-1"},
+                {"text": "✏️ Entry +1%",  "callback_data": f"EDITENTRY_{proposal_id}_+1"},
+                {"text": "✏️ Entry -2%",  "callback_data": f"EDITENTRY_{proposal_id}_-2"},
+                {"text": "✏️ Entry +2%",  "callback_data": f"EDITENTRY_{proposal_id}_+2"},
+            ],
+        ]
     }
     return _send({
         "chat_id": settings.TELEGRAM_CHAT_ID,
@@ -139,9 +148,11 @@ def send_exit_alert(
     msg += f"\n*Rationale*: {rationale[:400]}"
 
     if action == "EXIT_NOW":
+        # G28: Two-step EXIT — first step shows "Request Exit" which triggers a
+        # confirmation prompt, preventing accidental position closes.
         reply_markup = {
             "inline_keyboard": [[
-                {"text": "✅ Exit Now",      "callback_data": f"EXIT_{execution_id}"},
+                {"text": "🔴 Request Exit",  "callback_data": f"EXITCONFIRM_{execution_id}"},
                 {"text": "⏸ Hold for now",  "callback_data": f"HOLD_{execution_id}"},
             ]]
         }

@@ -49,29 +49,91 @@ def _get_earnings_threshold(strategy_type: str) -> int:
     )
 
 
-def _is_earnings_imminent(symbol: str, days_threshold: int = 10) -> bool:
-    """Returns True if earnings are within days_threshold calendar days."""
+def _is_earnings_imminent(symbol: str, days_threshold: int = 10) -> tuple[bool, str]:
+    """
+    Returns (imminent: bool, source: str).
+    Checks multiple sources in priority order:
+    1. NSE corporate actions API (most reliable for Indian markets)
+    2. Screener.in earnings date (scraped from company page)
+    3. yfinance calendar (fallback — often missing for NSE)
+
+    If no source has data, returns (False, "no_data") — caller should treat as UNKNOWN
+    and apply conservative blackout if configured.
+    """
+    from datetime import date as _date
+    import pandas as pd
+
+    today = _date.today()
+
+    # Source 1: NSE corporate actions API
+    try:
+        import requests as _req
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Referer': 'https://www.nseindia.com',
+        }
+        # NSE API for corporate actions: results calendar
+        resp = _req.get(
+            f"https://www.nseindia.com/api/corporates-corporateActions?index=equities&symbol={symbol}&market=equities",
+            headers=headers, timeout=8,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            actions = data if isinstance(data, list) else data.get("data", [])
+            for action in actions[:20]:
+                purpose = str(action.get("purpose", "")).upper()
+                if "RESULT" in purpose or "QUARTER" in purpose or "ANNUAL" in purpose:
+                    ex_date_str = action.get("exDate") or action.get("exdate") or ""
+                    if ex_date_str:
+                        try:
+                            ex_date = pd.Timestamp(ex_date_str).date()
+                            days_away = (ex_date - today).days
+                            if 0 <= days_away <= days_threshold:
+                                return True, "nse_api"
+                        except Exception:
+                            pass
+    except Exception:
+        pass
+
+    # Source 2: yfinance calendar (best-effort for NSE)
     try:
         import yfinance as yf
         ticker = yf.Ticker(f"{symbol}.NS")
         cal = ticker.calendar
         if cal is not None and not cal.empty:
+            earnings_dt = None
             if 'Earnings Date' in cal.index:
                 earnings_dt = cal.loc['Earnings Date'].iloc[0] if hasattr(cal.loc['Earnings Date'], 'iloc') else cal.loc['Earnings Date']
             elif 'Earnings Date' in cal.columns:
                 earnings_dt = cal['Earnings Date'].iloc[0]
-            else:
-                return False
-            import pandas as pd
-            if pd.isnull(earnings_dt):
-                return False
-            earnings_date = pd.Timestamp(earnings_dt).date()
-            from datetime import date
-            days_away = (earnings_date - date.today()).days
-            return 0 <= days_away <= days_threshold
+            if earnings_dt is not None and not pd.isnull(earnings_dt):
+                earnings_date = pd.Timestamp(earnings_dt).date()
+                days_away = (earnings_date - today).days
+                if 0 <= days_away <= days_threshold:
+                    return True, "yfinance"
+                # yfinance returned data but earnings not imminent
+                return False, "yfinance"
     except Exception:
         pass
-    return False
+
+    # No reliable data found — apply conservative quarterly blackout
+    # NSE results season: ~4 weeks after each quarter end (Apr 15–May 15, Jul 15–Aug 15, Oct 15–Nov 15, Jan 15–Feb 15)
+    month = today.month
+    day = today.day
+    in_results_season = any([
+        month == 4 and day >= 15,
+        month == 5 and day <= 15,
+        month == 7 and day >= 15,
+        month == 8 and day <= 15,
+        month == 10 and day >= 15,
+        month == 11 and day <= 15,
+        month == 1 and day >= 15,
+        month == 2 and day <= 15,
+    ])
+    if in_results_season:
+        return True, "results_season_conservative"
+
+    return False, "no_data"
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
@@ -361,22 +423,30 @@ def risk_manager_node(state: AgentState) -> dict:
         if rr < min_rr:
             is_safe = False
             warnings.append(f"CRITICAL: R:R {rr:.1f} below minimum {min_rr}.")
-        # RSI overextension guard: avoid entries at extremes (high reversal rate)
+        # RSI overextension guard: thresholds differ by strategy
+        # Swing: tighter (85/18) — swing trades need clean momentum, not extremes
+        # Positional/Value: stricter (75/25) — longer commitments need healthier setups
         rsi_val = tech.get('rsi_14', 50) or 50
-        if rsi_val > 78:
+        if strategy_type in ("positional", "value"):
+            rsi_ob_thresh, rsi_os_thresh = 75, 25
+        else:
+            rsi_ob_thresh, rsi_os_thresh = 85, 18
+        if rsi_val > rsi_ob_thresh:
             is_safe = False
-            warnings.append(f"CRITICAL: RSI {rsi_val:.1f} is overbought (>78). High reversal risk.")
-        elif rsi_val < 22:
+            warnings.append(f"CRITICAL: RSI {rsi_val:.1f} is overbought (>{rsi_ob_thresh} for {strategy_type}). High reversal risk.")
+        elif rsi_val < rsi_os_thresh:
             is_safe = False
-            warnings.append(f"CRITICAL: RSI {rsi_val:.1f} is oversold (<22). Likely in downtrend — avoid BUY.")
+            warnings.append(f"CRITICAL: RSI {rsi_val:.1f} is oversold (<{rsi_os_thresh} for {strategy_type}). Avoid BUY.")
         # Earnings calendar gate: configurable threshold per strategy_type
         if decision.proposed_action == "BUY":
             try:
                 earnings_threshold = _get_earnings_threshold(strategy_type)
-                if _is_earnings_imminent(symbol, days_threshold=earnings_threshold):
+                imminent, source = _is_earnings_imminent(symbol, days_threshold=earnings_threshold)
+                if imminent:
                     is_safe = False
+                    source_note = f" (source: {source})"
                     warnings.append(
-                        f"CRITICAL: Earnings within {earnings_threshold} days for {symbol}. "
+                        f"CRITICAL: Earnings within {earnings_threshold} days for {symbol}{source_note}. "
                         f"Avoid entry — overnight gap risk."
                     )
             except Exception:

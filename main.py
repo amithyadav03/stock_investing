@@ -323,15 +323,24 @@ async def telegram_webhook(request: Request):
             except Exception:
                 pass
 
-            # Recalculate position size at approval time using current price and available capital
+            # Recalculate position size at approval time using AMO-adjusted entry price
+            # G10 fix: use adjusted_entry (includes AMO gap) for accurate risk calc
             qty = max(1, getattr(proposal, 'quantity', 1) or 1)
+            live_price = proposal.proposed_price  # Fallback
             try:
                 from tools.market_data import market_data_tool as _mdt
                 from core.capital_manager import capital_manager
-                live_price = _mdt.get_current_price(proposal.symbol)
-                if live_price > 0 and proposal.stop_loss and abs(live_price - proposal.stop_loss) > 0:
+                strat_cfg = settings.strategy.get("trading", {})
+                _order_variety = strat_cfg.get("order_variety", "AMO").lower()
+                _amo_gap = 0.005
+                live_price = _mdt.get_current_price(proposal.symbol) or proposal.proposed_price
+                # Use AMO-adjusted price for risk calc (actual fill will be at this price)
+                pricing_entry = round(
+                    live_price * (1 + _amo_gap if proposal.direction == "BUY" else 1 - _amo_gap), 2
+                ) if _order_variety == "amo" else live_price
+                if pricing_entry > 0 and proposal.stop_loss and abs(pricing_entry - proposal.stop_loss) > 0:
                     sizing = capital_manager.calculate_position_size(
-                        entry_price=live_price,
+                        entry_price=pricing_entry,
                         stop_loss=proposal.stop_loss,
                         conviction_tier=proposal.conviction_tier or "MEDIUM",
                         strategy_type=proposal.strategy_type or "swing",
@@ -340,7 +349,7 @@ async def telegram_webhook(request: Request):
                     if recalc_qty > 0:
                         qty = recalc_qty
                         vix_mult = sizing.get("vix_multiplier", 1.0)
-                        print(f"[Webhook] Qty recalculated at approval: {qty} @ ₹{live_price:.2f} (VIX mult={vix_mult:.2f})")
+                        print(f"[Webhook] Qty recalculated: {qty} @ ₹{pricing_entry:.2f} (AMO-adj, VIX={vix_mult:.2f})")
             except Exception as e:
                 print(f"[Webhook] Qty recalc failed, using original: {e}")
 
@@ -397,28 +406,11 @@ async def telegram_webhook(request: Request):
                     )
                     print(f"[Webhook] Entry order placed on Kite. ID: {order_id}, price: ₹{adjusted_entry}")
 
-                    # Place SL-M order alongside entry (bracket-style protection)
-                    sl_order_id = None
-                    try:
-                        sl_tx = kite.TRANSACTION_TYPE_SELL if proposal.direction == "BUY" else kite.TRANSACTION_TYPE_BUY
-                        sl_order_id = kite.place_order(
-                            tradingsymbol=proposal.symbol,
-                            exchange=kite.EXCHANGE_NSE,
-                            transaction_type=sl_tx,
-                            quantity=qty,
-                            variety=kite.VARIETY_REGULAR,
-                            order_type=kite.ORDER_TYPE_SLM,
-                            product=product,
-                            trigger_price=adjusted_sl,
-                        )
-                        print(f"[Webhook] SL-M order placed. ID: {sl_order_id}, trigger: ₹{adjusted_sl}")
-                    except Exception as sl_err:
-                        print(f"[Webhook] SL order placement failed (non-fatal): {sl_err}")
-                        notify_error(proposal.symbol, f"SL order failed for {proposal.symbol}: {sl_err}. Monitor manually.")
-
-                    # Poll entry order status — extend to 180s for AMO (AMO shows OPEN until next market open)
+                    # Poll entry order status — 180s for AMO (OPEN = accepted, awaits market open)
                     import time as _time
                     order_status = "PENDING"
+                    filled_qty = qty
+                    actual_fill_price = adjusted_entry
                     poll_interval = strat.get("order_poll_interval_seconds", 5)
                     max_polls = 36  # 36 × 5s = 180s total
                     for _ in range(max_polls):
@@ -427,12 +419,17 @@ async def telegram_webhook(request: Request):
                             for o in orders:
                                 if str(o.get("order_id")) == str(order_id):
                                     order_status = o.get("status", "UNKNOWN")
+                                    # G14: capture actual filled quantity and price
+                                    filled_qty = int(o.get("filled_quantity") or qty)
+                                    avg_price = o.get("average_price")
+                                    if avg_price and float(avg_price) > 0:
+                                        actual_fill_price = float(avg_price)
                                     break
                         except Exception as poll_err:
                             print(f"[Webhook] Order status poll failed: {poll_err}")
                             break
+                        # OPEN = AMO accepted (queued for market open) — treat as success for AMO
                         if order_status in ("COMPLETE", "OPEN"):
-                            # OPEN = AMO accepted but not yet filled (will execute at market open)
                             break
                         if order_status in ("CANCELLED", "REJECTED"):
                             break
@@ -445,15 +442,48 @@ async def telegram_webhook(request: Request):
                         print(f"[Webhook] Order {order_id} {order_status}. Proposal marked KITE_FAILED.")
                         return {"status": "ok", "msg": f"Order {order_status} by Kite."}
 
+                    # G12: SL-M order is MANDATORY — cancel entry and abort if SL placement fails
+                    # Use actual filled_qty so SL covers exactly the shares we own
+                    sl_order_id = None
+                    sl_qty = filled_qty if filled_qty > 0 else qty
+                    try:
+                        sl_tx = kite.TRANSACTION_TYPE_SELL if proposal.direction == "BUY" else kite.TRANSACTION_TYPE_BUY
+                        sl_order_id = kite.place_order(
+                            tradingsymbol=proposal.symbol,
+                            exchange=kite.EXCHANGE_NSE,
+                            transaction_type=sl_tx,
+                            quantity=sl_qty,
+                            variety=kite.VARIETY_REGULAR,
+                            order_type=kite.ORDER_TYPE_SLM,
+                            product=product,
+                            trigger_price=adjusted_sl,
+                        )
+                        print(f"[Webhook] SL-M placed. ID: {sl_order_id}, trigger: ₹{adjusted_sl}, qty: {sl_qty}")
+                    except Exception as sl_err:
+                        # G12: SL is mandatory. Cancel entry order and mark failed.
+                        print(f"[Webhook] CRITICAL: SL order failed for {proposal.symbol}: {sl_err}. Cancelling entry.")
+                        try:
+                            kite.cancel_order(variety=variety, order_id=order_id)
+                            print(f"[Webhook] Entry order {order_id} cancelled due to SL failure.")
+                        except Exception as cancel_err:
+                            print(f"[Webhook] Could not cancel entry order: {cancel_err}")
+                        proposal.status = "KITE_FAILED"
+                        session.commit()
+                        notify_error(
+                            proposal.symbol,
+                            f"SL order placement failed: {sl_err}. Entry order {order_id} cancelled. No position opened."
+                        )
+                        return {"status": "ok", "msg": "Entry cancelled — SL order could not be placed."}
+
                     proposal.status = "EXECUTED"
-                    print(f"[Webhook] EXECUTED on Kite. Order ID: {order_id} | Status: {order_status}")
+                    print(f"[Webhook] EXECUTED. Entry: {order_id} ({order_status}), SL: {sl_order_id}, filled_qty: {filled_qty}")
 
                     execution = TradeExecution(
                         proposal_id=proposal.id,
                         symbol=proposal.symbol,
                         direction=proposal.direction,
-                        quantity=qty,
-                        entry_price=adjusted_entry,
+                        quantity=filled_qty,          # G14: use actual filled qty
+                        entry_price=actual_fill_price, # G14: use actual fill price
                         entry_time=datetime.utcnow(),
                         kite_order_id=str(order_id),
                         strategy_type=proposal.strategy_type or "swing",
@@ -461,7 +491,7 @@ async def telegram_webhook(request: Request):
                     )
                     session.add(execution)
                     session.commit()
-                    print(f"[Webhook] TradeExecution #{execution.id} created for {proposal.symbol}.")
+                    print(f"[Webhook] TradeExecution #{execution.id} created for {proposal.symbol} ({filled_qty} shares @ ₹{actual_fill_price}).")
 
                 except Exception as e:
                     proposal.status = "KITE_FAILED"
@@ -505,6 +535,79 @@ async def telegram_webhook(request: Request):
                 })
         finally:
             session.close()
+
+    # ── Trade Proposal: EDITENTRY (adjust entry price ±%) ─────────────────────
+    elif action == "EDITENTRY":
+        # callback_data: EDITENTRY_{proposal_id}_{pct}  e.g. EDITENTRY_42_-1
+        proposal_id = int(parts[1])
+        pct_str = parts[2]  # e.g. "-1" or "+2"
+        try:
+            pct = float(pct_str)
+        except ValueError:
+            pct = 0.0
+        session = SessionLocal()
+        try:
+            proposal = session.query(TradeProposal).filter(
+                TradeProposal.id == proposal_id,
+                TradeProposal.status == "PENDING",
+            ).first()
+            if not proposal:
+                _send({"chat_id": settings.TELEGRAM_CHAT_ID,
+                       "text": "Proposal not found or already processed.", "parse_mode": "Markdown"})
+            else:
+                old_entry = proposal.proposed_price or 0.0
+                new_entry = round(old_entry * (1 + pct / 100), 2)
+                proposal.proposed_price = new_entry
+                # Recalculate SL and TP maintaining same ATR-based distances
+                if proposal.stop_loss and old_entry > 0:
+                    sl_dist = abs(old_entry - proposal.stop_loss)
+                    proposal.stop_loss = round(new_entry - sl_dist if proposal.direction == "BUY" else new_entry + sl_dist, 2)
+                if proposal.take_profit and old_entry > 0:
+                    tp_dist = abs(proposal.take_profit - old_entry)
+                    proposal.take_profit = round(new_entry + tp_dist if proposal.direction == "BUY" else new_entry - tp_dist, 2)
+                session.commit()
+                sign = "+" if pct >= 0 else ""
+                _send({
+                    "chat_id": settings.TELEGRAM_CHAT_ID,
+                    "text": (
+                        f"✏️ *Entry Adjusted* — `{proposal.symbol}`\n\n"
+                        f"Old entry: ₹{old_entry}\n"
+                        f"New entry: ₹{new_entry} ({sign}{pct:.0f}%)\n"
+                        f"New SL: ₹{proposal.stop_loss}\n"
+                        f"New TP: ₹{proposal.take_profit}\n\n"
+                        f"_Approve or reject the updated proposal._"
+                    ),
+                    "parse_mode": "Markdown",
+                })
+                print(f"[Webhook] Proposal #{proposal_id} entry adjusted {sign}{pct}% → ₹{new_entry}")
+        finally:
+            session.close()
+
+    # ── Active Position: EXITCONFIRM (first step — show confirmation) ──────────
+    elif action == "EXITCONFIRM":
+        execution_id = int(parts[1])
+        data = get_position_with_proposal(execution_id)
+        if data:
+            pnl = data.get("pnl_pct", 0.0)
+            pnl_str = f"{'+' if pnl >= 0 else ''}{pnl:.2f}%"
+            pnl_emoji = "✅" if pnl >= 0 else "❌"
+            _send({
+                "chat_id": settings.TELEGRAM_CHAT_ID,
+                "text": (
+                    f"⚠️ *Confirm Exit — {data['symbol']}*\n\n"
+                    f"Current price: ₹{data.get('current_price', 0):.2f}\n"
+                    f"P&L: {pnl_emoji} `{pnl_str}`\n"
+                    f"Qty: {data.get('quantity', 0)} shares\n\n"
+                    f"_Are you sure? This will place a MARKET exit order immediately._"
+                ),
+                "parse_mode": "Markdown",
+                "reply_markup": {
+                    "inline_keyboard": [[
+                        {"text": "✅ CONFIRM EXIT", "callback_data": f"EXIT_{execution_id}"},
+                        {"text": "❌ Cancel",        "callback_data": f"HOLD_{execution_id}"},
+                    ]]
+                },
+            })
 
     # ── Active Position: EXIT ──────────────────────────────────────────────────
     elif action == "EXIT":

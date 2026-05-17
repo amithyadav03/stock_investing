@@ -71,8 +71,8 @@ risk:
   max_liquidity_percent_of_volume: 0.01
   min_sl_atr_multiplier: 0.5
 
-  max_daily_loss_pct: 0.02
-  max_consecutive_losses: 3
+  max_daily_loss_pct: 0.01              # 1% daily realized loss → halt (was 2%)
+  max_consecutive_losses: 2             # 2 straight losses → halt (was 3)
   max_open_positions: 5
   max_drawdown_from_peak_pct: 0.15     # halt if equity drops 15% from all-time high
   max_positions_per_sector: 2           # prevent sector concentration

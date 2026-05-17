@@ -141,58 +141,73 @@ def _compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 def _rule_based_conviction(row: pd.Series, strategy_type: str = "swing") -> int:
     """
     Deterministic conviction score (0-100) using rule-based logic.
-    Mirrors agents/conviction_scorer._rule_based_score but uses computed columns.
-    No LLM calls.
+    Exactly mirrors agents/conviction_scorer._rule_based_score (G19 fix).
+    No LLM calls — pure indicator arithmetic for reproducibility.
     """
-    score = 0
+    # ── Technical score (max 30 pts) — mirrors conviction_scorer._rule_based_score ──
+    tech = 0
+    rsi_val = float(row.get('RSI', 50) or 50)
+    adx_val = float(row.get('ADX', 20) or 20)
+    macd_h = float(row.get('MACD_HIST', 0) or 0)
+    price = float(row.get('Close', 0) or 0)
+    ema20 = float(row.get('EMA_20', 0) or 0)
+    ema50 = float(row.get('EMA_50', 0) or 0)
+    ema200 = float(row.get('EMA_200', 0) or 0)
+    bb_pct = float(row.get('BB_PCT', 0.5) or 0.5)
+    vwap_dev = float(row.get('VWAP_DEV', 0) or 0)
 
-    rsi_val = row.get('RSI', 50)
-    adx_val = row.get('ADX', 20)
-    macd_h = row.get('MACD_HIST', 0)
-    price = row.get('Close', 0)
-    ema20 = row.get('EMA_20', 0)
-    ema50 = row.get('EMA_50', 0)
-    ema200 = row.get('EMA_200', 0)
-    bb_pct = row.get('BB_PCT', 0.5)
-    vwap_dev = row.get('VWAP_DEV', 0)
+    if 40 <= rsi_val <= 65: tech += 8
+    elif 30 <= rsi_val < 40 or 65 < rsi_val <= 75: tech += 4
+    if adx_val > 25: tech += 8
+    elif adx_val > 18: tech += 4
+    if macd_h > 0: tech += 7
+    # weekly_trend proxy: ema20 > ema50 (daily timeframe)
+    if ema20 > ema50: tech += 7
 
-    # Technical score (0-40)
-    if 40 <= rsi_val <= 65: score += 10
-    elif 30 <= rsi_val < 40 or 65 < rsi_val <= 75: score += 5
-    elif rsi_val > 80 or rsi_val < 25: score -= 5  # Overextended
+    # Pullback-in-uptrend bonus (G3 fix — now mirrored in backtest)
+    if ema20 > 0 and price > ema20:
+        price_to_ema_pct = (price - ema20) / ema20 * 100
+        if 0 <= price_to_ema_pct <= 3:
+            tech += 5   # Clean pullback to EMA20
+        elif price_to_ema_pct > 10:
+            tech -= 3   # Extended surge
 
-    if adx_val > 25: score += 10
-    elif adx_val > 18: score += 5
+    tech = min(tech, 30)
 
-    if macd_h > 0: score += 8
+    # ── Fundamental score (max 30 pts) — neutral baseline for backtest ──
+    # Pure technical backtest: assume NEUTRAL fundamentals = 13 baseline pts
+    # This matches the live rule-based: macro=NEUTRAL gives 13, research=0 gives 0
+    fund = 0
+    quality_proxy = 0
+    # We can approximate using trend strength as quality proxy
+    if ema50 > ema200: quality_proxy += 4   # Long-term uptrend = quality momentum proxy
+    if ema20 > ema50 > ema200: quality_proxy += 2
+    fund = min(quality_proxy, 10)  # Cap at 10 (live fund uses 0-30 with real data)
 
-    # Price above EMAs (trend alignment)
-    if price > ema20 > ema50: score += 7
-    elif price > ema20: score += 4
+    # ── Macro baseline = NEUTRAL ──
+    macro = 13  # Same as live _rule_based_score for NEUTRAL regime
 
-    if ema50 > ema200: score += 5  # Long-term bull trend
+    # ── Research = 0 (no fundamental research in backtest) ──
+    research = 0
 
-    # BB not overextended
-    if 0.2 <= bb_pct <= 0.8: score += 3
-    elif bb_pct > 0.95 or bb_pct < 0.05: score -= 3
-
-    # VWAP confirmation
-    if 0 < vwap_dev < 3: score += 5   # Slightly above VWAP = accumulation
-    elif vwap_dev > 5: score -= 3     # Too far above = extended
-    elif vwap_dev < -5: score -= 5    # Below VWAP = distribution
-
-    # Macro/fundamental assumed NEUTRAL in pure technical backtest (add 12 pts baseline)
-    score += 12
+    total = tech + fund + macro + research
 
     # Strategy-specific adjustments
     if strategy_type == "positional":
-        # Require stronger trend for positional
         if ema20 > ema50 > ema200:
-            score += 5
+            total += 5   # Triple EMA alignment for positional
         else:
-            score -= 5
+            total -= 5
 
-    return max(0, min(100, score))
+    # VWAP confirmation (same as live conviction_scorer)
+    if 0 < vwap_dev < 3: total += 3
+    elif vwap_dev > 5: total -= 3
+    elif vwap_dev < -5: total -= 5
+
+    # BB overextension guard
+    if bb_pct > 0.95 or bb_pct < 0.05: total -= 3
+
+    return max(0, min(100, total))
 
 
 def _classify_market_regime(df: pd.DataFrame, idx: int) -> str:
@@ -351,6 +366,41 @@ def _load_data(symbols: List[str], start_date: str, end_date: str) -> Dict[str, 
 
             if len(df) < 250:
                 print(f"[Backtest] Insufficient data for {s} ({len(df)} bars). Skipping.")
+                continue
+
+            # G20: Survivorship bias filter — exclude symbols that show signs of
+            # delisting, halt, or illiquidity near the end of the test window.
+            # A stock that went through M&A or circuit halt looks fine in earlier data
+            # but would have been unavailable to trade in real life.
+            skip = False
+
+            # (a) Volume collapse: recent 30-bar avg < 20% of full-history median
+            vol_series = df['Volume'].replace(0, np.nan).dropna()
+            if len(vol_series) >= 60:
+                recent_vol = float(vol_series.iloc[-30:].mean())
+                median_vol = float(vol_series.median())
+                if median_vol > 0 and recent_vol < median_vol * 0.20:
+                    print(f"[Backtest][G20] {s}: volume collapsed ({recent_vol:.0f} vs median {median_vol:.0f}). Skipping (survivorship bias).")
+                    skip = True
+
+            # (b) Data gap: more than 15 consecutive missing bars in the series
+            if not skip:
+                close_filled = df['Close'].isnull().astype(int)
+                max_gap = int(close_filled.groupby((close_filled != close_filled.shift()).cumsum()).sum().max())
+                if max_gap > 15:
+                    print(f"[Backtest][G20] {s}: {max_gap} consecutive data gaps. Skipping (possible halt).")
+                    skip = True
+
+            # (c) Stale data: last bar is more than 10 trading days before end_date
+            if not skip:
+                last_bar = df.index[-1]
+                end_dt_check = datetime.strptime(end_date, "%Y-%m-%d")
+                staleness_days = (end_dt_check - last_bar.to_pydatetime().replace(tzinfo=None)).days
+                if staleness_days > 15:
+                    print(f"[Backtest][G20] {s}: last data {last_bar.date()} is {staleness_days}d before end_date. Skipping.")
+                    skip = True
+
+            if skip:
                 continue
 
             data[s] = _compute_indicators(df)

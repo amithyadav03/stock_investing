@@ -11,8 +11,8 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from datetime import date as _date
 
-# NSE trading holidays 2025-2026 (update annually)
-NSE_HOLIDAYS = {
+# NSE trading holidays — hardcoded fallback (auto-fetched at startup via _fetch_nse_holidays)
+_NSE_HOLIDAYS_FALLBACK = {
     _date(2025, 1, 26), _date(2025, 2, 26), _date(2025, 3, 14),
     _date(2025, 3, 31), _date(2025, 4, 10), _date(2025, 4, 14),
     _date(2025, 4, 18), _date(2025, 5, 1),  _date(2025, 8, 15),
@@ -23,8 +23,53 @@ NSE_HOLIDAYS = {
     _date(2026, 10, 2), _date(2026, 12, 25),
 }
 
+NSE_HOLIDAYS: set = set(_NSE_HOLIDAYS_FALLBACK)
+
+
+def _fetch_nse_holidays() -> set:
+    """
+    G23: Auto-fetch NSE equity trading holidays from NSE API.
+    Falls back silently to hardcoded set if the API is unreachable.
+    Called once at startup so the set is always up-to-date.
+    """
+    import requests as _req
+    try:
+        resp = _req.get(
+            "https://www.nseindia.com/api/holiday-master?type=trading",
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            raise ValueError(f"HTTP {resp.status_code}")
+        data = resp.json()
+        holidays: set = set()
+        # Response format: {"CM": [{"tradingDate": "26-Jan-2025", ...}, ...], ...}
+        for segment_holidays in data.values():
+            if not isinstance(segment_holidays, list):
+                continue
+            for h in segment_holidays:
+                td = h.get("tradingDate") or h.get("date", "")
+                if not td:
+                    continue
+                for fmt in ("%d-%b-%Y", "%Y-%m-%d", "%d/%m/%Y"):
+                    try:
+                        holidays.add(datetime.strptime(td.strip(), fmt).date())
+                        break
+                    except ValueError:
+                        continue
+        if len(holidays) >= 10:  # Sanity: NSE has 12-15 holidays per year
+            print(f"[Scheduler] NSE holidays fetched: {len(holidays)} dates.")
+            return holidays
+        raise ValueError(f"Too few holidays parsed ({len(holidays)})")
+    except Exception as e:
+        print(f"[Scheduler] NSE holiday fetch failed ({e}). Using hardcoded fallback.")
+        return set(_NSE_HOLIDAYS_FALLBACK)
+
 IST = pytz.timezone("Asia/Kolkata")
 scheduler = BackgroundScheduler(timezone=IST)
+
+# G25: track post-market pipeline success so retries know whether to run
+_post_market_ran_ok: bool = False
 
 
 # ── Market Hours Helpers ───────────────────────────────────────────────────────
@@ -261,12 +306,29 @@ def job_midday_checkin():
 
 def job_post_market_analysis():
     """3:45 PM: Run post-market deep analysis pipeline on top candidates."""
+    global _post_market_ran_ok
     if not is_trading_day():
         return
+    _post_market_ran_ok = False
     try:
         _run_analysis_pipeline()
+        _post_market_ran_ok = True
     except Exception as e:
         print(f"[Scheduler] post_market_analysis error: {e}")
+
+
+def job_post_market_retry():
+    """G25: 4:15 PM / 4:45 PM — retry post-market pipeline if earlier run failed."""
+    global _post_market_ran_ok
+    if not is_trading_day() or _post_market_ran_ok:
+        return
+    print("[Scheduler] Retrying post-market analysis pipeline...")
+    try:
+        _run_analysis_pipeline()
+        _post_market_ran_ok = True
+        print("[Scheduler] Post-market retry succeeded.")
+    except Exception as e:
+        print(f"[Scheduler] post_market_retry error: {e}")
 
 
 def _run_analysis_pipeline():
@@ -430,6 +492,62 @@ def _add_to_watchlist(symbol, strategy_type, decision, score, settings):
         session.close()
 
 
+def job_premarket_revalidate():
+    """
+    G11: 9:10 AM IST — recheck price of all PENDING proposals before AMO activates.
+    Auto-rejects any proposal where price has drifted > 5% from the proposed entry.
+    Sends a brief Telegram summary of what passed / failed validation.
+    """
+    if not is_trading_day():
+        return
+    try:
+        from db.schema import SessionLocal, TradeProposal
+        from tools.market_data import market_data_tool
+        from core.telegram_bot import _send
+        from core.config import settings as _cfg
+
+        session = SessionLocal()
+        try:
+            pending = session.query(TradeProposal).filter(TradeProposal.status == "PENDING").all()
+            if not pending:
+                return
+
+            passed, rejected = [], []
+            drift_limit_pct = 5.0
+
+            for p in pending:
+                try:
+                    live_px = market_data_tool.get_current_price(p.symbol)
+                    if live_px <= 0 or not p.proposed_price:
+                        continue
+                    drift = abs(live_px - p.proposed_price) / p.proposed_price * 100
+                    if drift > drift_limit_pct:
+                        p.status = "ABORTED"
+                        rejected.append(f"`{p.symbol}` drifted {drift:.1f}% (was ₹{p.proposed_price}, now ₹{live_px:.2f})")
+                    else:
+                        passed.append(f"`{p.symbol}` ₹{live_px:.2f} (drift {drift:.1f}% ✅)")
+                except Exception as e:
+                    print(f"[Scheduler] Revalidate failed for {p.symbol}: {e}")
+
+            session.commit()
+
+            lines = ["🕤 *Pre-Market Revalidation (9:10 AM)*\n"]
+            if passed:
+                lines.append(f"✅ Proposals within tolerance ({len(passed)}):")
+                lines.extend(f"  • {p}" for p in passed)
+            if rejected:
+                lines.append(f"\n❌ Auto-rejected ({len(rejected)}) — price drifted >{drift_limit_pct:.0f}%:")
+                lines.extend(f"  • {r}" for r in rejected)
+            if not passed and not rejected:
+                lines.append("_No pending proposals to revalidate._")
+
+            _send({"chat_id": _cfg.TELEGRAM_CHAT_ID, "text": "\n".join(lines), "parse_mode": "Markdown"})
+        finally:
+            session.close()
+    except Exception as e:
+        print(f"[Scheduler] premarket_revalidate error: {e}")
+
+
 def job_eod_auto_close():
     """
     3:25 PM IST (5 minutes before market close): Force-close all paper positions
@@ -533,6 +651,10 @@ def job_expire_watchlist():
 
 def setup_scheduler():
     """Register all jobs and start the scheduler."""
+    # G23: Refresh NSE holiday calendar at startup
+    global NSE_HOLIDAYS
+    NSE_HOLIDAYS = _fetch_nse_holidays()
+
     # 24/7 jobs
     scheduler.add_job(
         job_news_monitor, IntervalTrigger(minutes=15),
@@ -553,6 +675,12 @@ def setup_scheduler():
         job_morning_brief,
         CronTrigger(day_of_week="mon-fri", hour=8, minute=30, timezone=IST),
         id="morning_brief", max_instances=1, replace_existing=True
+    )
+    # G11: Pre-market price revalidation (runs just before AMO window closes)
+    scheduler.add_job(
+        job_premarket_revalidate,
+        CronTrigger(day_of_week="mon-fri", hour=9, minute=10, timezone=IST),
+        id="premarket_revalidate", max_instances=1, replace_existing=True
     )
 
     # Market hours — position monitor every 10 min (check internally)
@@ -576,11 +704,21 @@ def setup_scheduler():
         id="eod_auto_close", max_instances=1, replace_existing=True
     )
 
-    # Post-market analysis
+    # Post-market analysis + G25 retries at 4:15 and 4:45
     scheduler.add_job(
         job_post_market_analysis,
         CronTrigger(day_of_week="mon-fri", hour=15, minute=45, timezone=IST),
         id="post_market_analysis", max_instances=1, replace_existing=True
+    )
+    scheduler.add_job(
+        job_post_market_retry,
+        CronTrigger(day_of_week="mon-fri", hour=16, minute=15, timezone=IST),
+        id="post_market_retry_1", max_instances=1, replace_existing=True
+    )
+    scheduler.add_job(
+        job_post_market_retry,
+        CronTrigger(day_of_week="mon-fri", hour=16, minute=45, timezone=IST),
+        id="post_market_retry_2", max_instances=1, replace_existing=True
     )
 
     # EOD report

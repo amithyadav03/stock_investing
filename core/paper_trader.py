@@ -3,7 +3,7 @@ Paper trading simulator — full trade lifecycle without real Kite orders.
 Tracks P&L vs Nifty 50 benchmark for performance validation.
 """
 
-from datetime import datetime
+from datetime import datetime, time as dtime
 from typing import Optional
 from db.schema import SessionLocal, PaperTrade, PerformanceLog, TradeProposal
 
@@ -79,7 +79,15 @@ def mark_paper_positions_to_market() -> list[dict]:
                 except Exception:
                     atr_val = 0.0
 
-                if atr_val > 0 and trade.entry_price and trade.entry_price > 0:
+                # G24: Skip trailing SL adjustments during NSE lunch (11:30-12:30 IST).
+                # Thin order books during lunch cause false breakouts that would
+                # move the stop prematurely, only to reverse after lunch reopens.
+                import pytz as _pytz
+                _ist = _pytz.timezone("Asia/Kolkata")
+                _now_ist = datetime.now(_ist).time()
+                _in_lunch = dtime(11, 30) <= _now_ist <= dtime(12, 30)
+
+                if atr_val > 0 and trade.entry_price and trade.entry_price > 0 and not _in_lunch:
                     if trade.direction == "BUY":
                         profit_pts = price - trade.entry_price
                         if profit_pts >= atr_val * 2:
@@ -137,13 +145,17 @@ def mark_paper_positions_to_market() -> list[dict]:
                         closed = True
                         print(f"[PaperTrader] MAX_HOLD: {trade.symbol} held {holding_days}d (max={max_hold}d).")
 
-                    # Close if flat (< 1% move) for 15+ days
+                    # Close if flat for 15+ days — use ATR-scaled threshold (G17 fix)
+                    # A volatile stock may naturally stay within 1% of entry on any day;
+                    # we close only if flat relative to its own volatility (0.5× ATR).
                     elif holding_days >= 15 and trade.entry_price and trade.entry_price > 0:
+                        flat_threshold_pct = (atr_val / trade.entry_price * 100 * 0.5) if (atr_val > 0 and trade.entry_price > 0) else 1.0
+                        flat_threshold_pct = max(0.5, min(flat_threshold_pct, 2.0))  # Clamp: 0.5-2%
                         unrealized_pct = abs((price - trade.entry_price) / trade.entry_price * 100)
-                        if unrealized_pct < 1.0:
+                        if unrealized_pct < flat_threshold_pct:
                             _close_paper_trade(session, trade, price, "TIME_EXIT_FLAT")
                             closed = True
-                            print(f"[PaperTrader] TIME_EXIT: {trade.symbol} held {holding_days}d with <1% move.")
+                            print(f"[PaperTrader] TIME_EXIT: {trade.symbol} held {holding_days}d, P&L={unrealized_pct:.2f}% < threshold {flat_threshold_pct:.2f}%.")
 
                 if closed:
                     auto_closed.append({"symbol": trade.symbol, "direction": trade.direction,
@@ -159,21 +171,27 @@ def mark_paper_positions_to_market() -> list[dict]:
 
 
 def _close_paper_trade(session, trade: PaperTrade, exit_price: float, reason: str):
-    trade.exit_price = exit_price
+    # G18: Apply realistic slippage + transaction costs to paper fills (mirrors live/backtest)
+    # 0.4% round-trip brokerage already in entry; apply 0.2% slippage at exit
+    PAPER_EXIT_SLIPPAGE = 0.002  # 0.2% — BUY exits slightly lower, SELL exits slightly higher
+    if trade.direction == "BUY":
+        slippage_adj_exit = round(exit_price * (1 - PAPER_EXIT_SLIPPAGE), 2)
+    else:
+        slippage_adj_exit = round(exit_price * (1 + PAPER_EXIT_SLIPPAGE), 2)
+
+    trade.exit_price = slippage_adj_exit
     trade.exit_time = datetime.utcnow()
     trade.exit_reason = reason
     trade.status = "CLOSED"
     if trade.entry_price and trade.entry_price > 0:
         if trade.direction == "BUY":
-            pnl_pct = ((exit_price - trade.entry_price) / trade.entry_price) * 100
+            pnl_pct = ((slippage_adj_exit - trade.entry_price) / trade.entry_price) * 100
+            trade.realized_pnl = round((slippage_adj_exit - trade.entry_price) * trade.quantity, 2)
         else:
-            pnl_pct = ((trade.entry_price - exit_price) / trade.entry_price) * 100
+            pnl_pct = ((trade.entry_price - slippage_adj_exit) / trade.entry_price) * 100
+            trade.realized_pnl = round((trade.entry_price - slippage_adj_exit) * trade.quantity, 2)
         trade.realized_pnl_pct = round(pnl_pct, 2)
-        if trade.direction == "BUY":
-            trade.realized_pnl = round((exit_price - trade.entry_price) * trade.quantity, 2)
-        else:
-            trade.realized_pnl = round((trade.entry_price - exit_price) * trade.quantity, 2)
-    print(f"[PaperTrader] CLOSED: {trade.symbol} @ ₹{exit_price} | {reason} | P&L: {trade.realized_pnl_pct:.2f}%")
+    print(f"[PaperTrader] CLOSED: {trade.symbol} @ ₹{slippage_adj_exit} | {reason} | P&L: {trade.realized_pnl_pct:.2f}%")
 
 
 def close_paper_position(paper_trade_id: int, exit_price: float, reason: str = "MANUAL") -> bool:

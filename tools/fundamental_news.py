@@ -28,6 +28,10 @@ class FundamentalNewsTool:
         """
         Fetches fundamentals with Screener.in as primary, yfinance as fallback.
         Results cached 24h in TTL cache. Returns standardized numeric fields where possible.
+
+        DEGRADED MODE: If screener fails and yfinance fallback is missing critical fields
+        (promoter_holding, quality governance data), result includes 'data_quality': 'DEGRADED'
+        flag. Callers should cap conviction scores to prevent trading on incomplete data.
         """
         from core.cache import cache, TTL_FUNDAMENTALS
 
@@ -39,6 +43,11 @@ class FundamentalNewsTool:
         result = self._fetch_screener(symbol)
         if result.get("error"):
             result = self._fetch_yfinance(symbol)
+            # Mark as degraded — missing governance/pledge data
+            result["data_quality"] = "DEGRADED"
+            result["data_quality_reason"] = "screener.in unavailable; using yfinance (missing promoter/pledge data)"
+        else:
+            result["data_quality"] = "FULL"
 
         # Compute quality score
         result["quality_score"] = self._compute_quality_score(result)
@@ -122,9 +131,10 @@ class FundamentalNewsTool:
                 if name_el and val_el:
                     ratios[name_el.text.strip()] = val_el.text.strip()
 
-        # Extract profit growth from quarterly table
+        # Extract profit and revenue growth from quarterly AND annual tables
         profit_growth_qoq = "N/A"
         revenue_growth_qoq = "N/A"
+        revenue_growth_yoy = "N/A"
         profit_growth_annual = "N/A"
         try:
             for table_id in ['quarters', 'profit-loss']:
@@ -149,13 +159,16 @@ class FundamentalNewsTool:
                         prev, curr = vals[-2], vals[-1]
                         if prev != 0:
                             growth = round((curr - prev) / abs(prev) * 100, 1)
-                            if 'net profit' in row_text or 'profit' in row_text:
+                            if 'net profit' in row_text or 'profit after tax' in row_text:
                                 if table_id == 'quarters':
                                     profit_growth_qoq = f"{growth}%"
                                 else:
                                     profit_growth_annual = f"{growth}%"
                             elif 'revenue' in row_text or 'sales' in row_text:
-                                revenue_growth_qoq = f"{growth}%"
+                                if table_id == 'quarters':
+                                    revenue_growth_qoq = f"{growth}%"
+                                else:
+                                    revenue_growth_yoy = f"{growth}%"  # Annual revenue growth
         except Exception:
             pass
 
@@ -203,7 +216,8 @@ class FundamentalNewsTool:
             "current_ratio": self._safe_float(ratios.get("Current ratio") or ratios.get("Current Ratio")),
             "profit_growth_qoq": profit_growth_qoq,
             "profit_growth_annual": profit_growth_annual,
-            "revenue_growth": revenue_growth_qoq,
+            "revenue_growth": revenue_growth_qoq,        # QoQ revenue growth
+            "revenue_growth_yoy": revenue_growth_yoy,    # YoY revenue growth (annual table)
             "eps_growth": eps_growth,
         }
 
@@ -290,11 +304,22 @@ class FundamentalNewsTool:
             elif pledge_val and pledge_val > 30: score -= 8
             elif pledge_val and pledge_val > 10: score -= 3
 
-        # Revenue growth (0-10 pts)
+        # Revenue growth (0-10 pts) — require BOTH QoQ and YoY to be positive for full score
+        # This prevents seasonal spikes from inflating scores (G7 fix)
         rev_f = self._safe_float(str(rev_growth).replace('%', ''), 0)
-        if rev_f and rev_f >= 20: score += 10
-        elif rev_f and rev_f >= 10: score += 6
-        elif rev_f and rev_f < 0: score -= 5
+        rev_yoy_f = self._safe_float(str(data.get("revenue_growth_yoy", "N/A")).replace('%', ''), None)
+        if rev_f and rev_f >= 20:
+            if rev_yoy_f is not None and rev_yoy_f >= 10:
+                score += 10   # Both QoQ and YoY positive — high confidence
+            else:
+                score += 5    # Only QoQ strong — possibly seasonal
+        elif rev_f and rev_f >= 10:
+            score += 6
+        elif rev_f and rev_f < 0:
+            score -= 5
+        # Additional YoY-only penalty: declining annual revenue
+        if rev_yoy_f is not None and rev_yoy_f < -5:
+            score -= 5
 
         # Current ratio liquidity (0-5 pts)
         if cr and cr >= 2.0: score += 5

@@ -226,8 +226,12 @@ class CapitalManager:
                     if ecol not in returns.columns:
                         continue
                     corr = float(np.corrcoef(returns[new_col].values, returns[ecol].values)[0, 1])
-                    if corr > 0.85:
-                        return False, f"High correlation ({corr:.2f}) with existing position {existing}."
+                    # G9: 0.75 threshold (industry standard); same sector pairs get 0.80 leeway
+                    existing_sector = self.get_sector(existing)
+                    new_sector = self.get_sector(new_symbol)
+                    corr_limit = 0.80 if existing_sector == new_sector else 0.75
+                    if corr > corr_limit:
+                        return False, f"High correlation ({corr:.2f} > {corr_limit}) with existing position {existing} ({existing_sector})."
             except Exception as e:
                 print(f"[CapitalManager] Correlation check failed: {e}")
             return True, ""
