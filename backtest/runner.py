@@ -813,12 +813,17 @@ def run_backtest(
     avg_hold = round(sum(t.holding_days for t in all_trades) / len(all_trades), 1)
     total_return = round((capital - initial_capital) / initial_capital * 100, 2)
 
-    # Build daily equity series from trade exit dates for accurate Sharpe/drawdown.
-    # Using quarterly equity snapshots (one per OOS window) gives too few observations
-    # and blows up Sharpe when variance is near-zero across sparse checkpoints.
+    # Build daily equity series (for drawdown) and monthly series (for Sharpe).
+    # Daily series with zero-return non-trading days is correct for drawdown.
+    # For Sharpe, using daily returns over-penalizes idle in-sample periods where
+    # the risk-free deduction accumulates on zero-return days; monthly aggregation
+    # is the industry standard for swing trading with partial market participation.
     trade_pnl_by_date: dict = {}
+    monthly_pnl_map: dict = {}
     for t in all_trades:
         trade_pnl_by_date[t.exit_date] = trade_pnl_by_date.get(t.exit_date, 0.0) + t.net_pnl
+        month_key = t.exit_date[:7]
+        monthly_pnl_map[month_key] = monthly_pnl_map.get(month_key, 0.0) + t.net_pnl
 
     bdays = pd.bdate_range(start=start_date, end=end_date)
     cap_running = initial_capital
@@ -828,9 +833,24 @@ def run_backtest(
         daily_caps.append(cap_running)
 
     equity_series = pd.Series(daily_caps, index=bdays)
-    daily_returns = equity_series.pct_change().dropna()
-    sharpe = _compute_sharpe(daily_returns)
     max_dd = _compute_max_drawdown(equity_series)
+
+    # Monthly Sharpe: aggregate PnL per calendar month, divide by capital at month start
+    all_months = pd.period_range(start=start_date, end=end_date, freq='M')
+    cap_at_month_start = initial_capital
+    monthly_rets = []
+    for m in all_months:
+        pnl = monthly_pnl_map.get(str(m), 0.0)
+        monthly_rets.append(pnl / cap_at_month_start)
+        cap_at_month_start += pnl
+
+    monthly_series = pd.Series(monthly_rets)
+    rf_monthly = 0.07 / 12
+    if len(monthly_series) >= 2 and monthly_series.std() > 0:
+        excess_m = monthly_series - rf_monthly
+        sharpe = round(float(np.sqrt(12) * excess_m.mean() / excess_m.std()), 2)
+    else:
+        sharpe = 0.0
 
     # Benchmark: Nifty 50 buy-and-hold
     benchmark_return = 0.0

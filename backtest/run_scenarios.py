@@ -23,7 +23,7 @@ import os
 # Make sure project root is in path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from backtest.runner import run_backtest, run_monte_carlo
+from backtest.runner import run_backtest
 
 # ── Symbol universe — Nifty 50 liquid names ────────────────────────────────────
 # These are the most liquid NSE stocks with 7+ years of clean data.
@@ -128,10 +128,8 @@ def run_all_scenarios(strategy_type: str = "swing", capital: float = 500_000):
                 output_dir=f"backtest/results/{s['name']}",
             )
 
-            # Monte Carlo on the trade list from this scenario
-            mc = {}
-            if results.trades and len(results.trades) >= 10:
-                mc = run_monte_carlo(results.trades, capital)
+            # Monte Carlo is already run inside run_backtest(); reuse those results
+            mc = results.monte_carlo or {}
 
             row = {
                 "scenario": s["label"],
