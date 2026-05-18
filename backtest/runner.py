@@ -266,7 +266,12 @@ def _estimate_fill_probability(quantity: int, avg_daily_volume: float) -> float:
     return 0.25
 
 
-def _generate_signal(df: pd.DataFrame, idx: int, strategy_type: str) -> Optional[dict]:
+def _generate_signal(
+    df: pd.DataFrame,
+    idx: int,
+    strategy_type: str,
+    nifty_regime: str = "BULL",
+) -> Optional[dict]:
     """
     Generate a BUY signal at position idx if conviction passes threshold.
     Applies market regime filter and fill-probability check.
@@ -279,10 +284,31 @@ def _generate_signal(df: pd.DataFrame, idx: int, strategy_type: str) -> Optional
     row = df.iloc[idx]
     params = STRATEGY_PARAMS[strategy_type]
 
-    # Market regime filter: don't enter new BULL positions during BEAR regime
+    # Hard trend gate: EMA_20 must be above EMA_50.
+    # Entries below this cross are "catching a falling knife" — the single
+    # biggest source of losing trades in choppy/correcting markets.
+    ema20 = float(row.get('EMA_20', 0) or 0)
+    ema50 = float(row.get('EMA_50', 0) or 0)
+    if ema20 <= ema50:
+        return None
+
+    # Market regime filter: no new longs in stock-level bear
     regime = _classify_market_regime(df, idx)
     if regime == "BEAR":
-        return None  # No new longs in bear market
+        return None
+
+    # Nifty market breadth: if broad market is bearish, skip entirely.
+    # If both the stock AND the market are in sideways chop, skip (double sideways = noise).
+    if nifty_regime == "BEAR":
+        return None
+    if nifty_regime == "SIDEWAYS" and regime == "SIDEWAYS":
+        return None
+
+    # Volume confirmation: avoid entering on thin/dead-volume days (false breakouts).
+    vol = float(row.get('Volume', 0) or 0)
+    avg_vol = float(df['Volume'].iloc[max(0, idx - 20):idx].mean()) if idx > 0 else 0
+    if avg_vol > 0 and vol < 0.7 * avg_vol:
+        return None
 
     conviction = _rule_based_conviction(row, strategy_type)
     # Apply regime bonus/penalty
@@ -425,6 +451,7 @@ def _simulate_symbol(
     strategy_type: str,
     initial_capital: float,
     max_positions: int = 3,
+    nifty_regime_by_date: dict = None,
 ) -> Tuple[List[BacktestTrade], float]:
     """
     Simulate trading for one symbol in one test window.
@@ -505,7 +532,10 @@ def _simulate_symbol(
             if full_idx is None:
                 continue
 
-            signal = _generate_signal(df, full_idx, strategy_type)
+            nifty_regime = "BULL"
+            if nifty_regime_by_date is not None:
+                nifty_regime = nifty_regime_by_date.get(str(current_date.date()), "SIDEWAYS")
+            signal = _generate_signal(df, full_idx, strategy_type, nifty_regime)
             if signal:
                 # Use next bar's Open as entry (can't trade at today's close when decision is made at close)
                 next_idx = full_idx + 1
@@ -726,6 +756,15 @@ def run_backtest(
     if not all_data:
         raise ValueError("No data loaded. Check symbols and date range.")
 
+    # Build Nifty market-breadth regime series (date → BULL/SIDEWAYS/BEAR)
+    # Used in _generate_signal to filter out longs when broad market is bearish/choppy
+    nifty_regime_by_date: dict = {}
+    if "_NIFTY50" in all_data:
+        nifty_df = all_data["_NIFTY50"]
+        for i in range(len(nifty_df)):
+            d = nifty_df.index[i].strftime("%Y-%m-%d")
+            nifty_regime_by_date[d] = _classify_market_regime(nifty_df, i)
+
     # Generate walk-forward windows
     start_dt = datetime.strptime(start_date, "%Y-%m-%d")
     end_dt = datetime.strptime(end_date, "%Y-%m-%d")
@@ -766,6 +805,7 @@ def run_backtest(
                 test_end=test_end,
                 strategy_type=strategy_type,
                 initial_capital=capital / max_pos,  # size each symbol slot as 1/max_pos of capital
+                nifty_regime_by_date=nifty_regime_by_date,
             )
             window_trades.extend(trades)
 
