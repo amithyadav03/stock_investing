@@ -45,10 +45,9 @@ STRATEGY_PARAMS = {
         "min_rr": 1.5,
         "atr_sl_mult": 2.0,
         "atr_tp_mult": 3.0,  # TP = entry + 3×ATR
-        # Backtest threshold is lower than live (65) because this scorer uses
-        # only technical indicators (max ~56-61). Live mode adds LLM + fundamental
-        # scoring that pushes totals above 65. A backtest score of 40 ≈ live 65.
-        "conviction_threshold": 40,
+        # Threshold raised from 40 to 48: eliminates marginal setups that were
+        # generating 40-44% win rates. Requires RSI + ADX + MACD all strong.
+        "conviction_threshold": 48,
         "risk_pct": 0.01,
     },
     "positional": {
@@ -56,7 +55,7 @@ STRATEGY_PARAMS = {
         "min_rr": 2.0,
         "atr_sl_mult": 2.5,
         "atr_tp_mult": 5.0,
-        "conviction_threshold": 45,  # live=72, scaled for technical-only scorer
+        "conviction_threshold": 52,  # live=72, scaled for technical-only scorer
         "risk_pct": 0.01,
     },
 }
@@ -238,6 +237,41 @@ def _classify_market_regime(df: pd.DataFrame, idx: int) -> str:
         return "BULL"
     elif not above_ema200 and price < ema50 and trending:
         return "BEAR"
+    return "SIDEWAYS"
+
+
+def _classify_nifty_breadth(nifty_df: pd.DataFrame, idx: int) -> str:
+    """
+    Classify broad market breadth for stock entry decisions.
+
+    Uses EMA_50 as the primary level instead of EMA_200. EMA_200 lags
+    3–6 months and only turns bearish during multi-year crashes (2008,
+    2020). Intermediate corrections like the 2018 -15% and 2022 -17%
+    drops never push Nifty below EMA_200, so using it misses those regimes.
+    EMA_50 responds in weeks and correctly identifies corrections.
+
+    Returns: BULL / BEAR / SIDEWAYS
+    """
+    if idx < 50:
+        return "SIDEWAYS"
+    row = nifty_df.iloc[idx]
+    price = float(row.get('Close', 0))
+    ema20 = float(row.get('EMA_20', 0))
+    ema50 = float(row.get('EMA_50', 0))
+    adx = float(row.get('ADX', 0))
+
+    if price <= 0 or ema50 <= 0:
+        return "SIDEWAYS"
+
+    # BEAR: price below EMA_50 (medium-term downtrend)
+    if price < ema50:
+        return "BEAR"
+    # BEAR: EMA_20 crossed below EMA_50 with any trend strength (early-warning)
+    if ema20 < ema50 and adx > 15:
+        return "BEAR"
+    # BULL: both EMA_20 and price above EMA_50
+    if price >= ema20 >= ema50:
+        return "BULL"
     return "SIDEWAYS"
 
 
@@ -477,6 +511,18 @@ def _simulate_symbol(
 
             exit_reason = None
             exit_price = current_price
+
+            # Trailing stop: once intraday high touches entry + 1×ATR,
+            # slide SL up to break-even (entry price). This converts
+            # trades that bounced then reversed from losses into 0% exits,
+            # improving the avg_loss without reducing win rate.
+            atr_val = active_trade.get('atr', 0)
+            if atr_val > 0:
+                breakeven_trigger = active_trade['entry_price'] + atr_val
+                if float(row['High']) >= breakeven_trigger:
+                    new_sl = active_trade['entry_price']
+                    if new_sl > active_trade['stop_loss']:
+                        active_trade['stop_loss'] = new_sl
 
             # Check stop loss (use intraday low for realistic exit)
             if float(row['Low']) <= active_trade['stop_loss']:
@@ -756,14 +802,17 @@ def run_backtest(
     if not all_data:
         raise ValueError("No data loaded. Check symbols and date range.")
 
-    # Build Nifty market-breadth regime series (date → BULL/SIDEWAYS/BEAR)
-    # Used in _generate_signal to filter out longs when broad market is bearish/choppy
+    # Build Nifty market-breadth regime series (date → BULL/SIDEWAYS/BEAR).
+    # Uses _classify_nifty_breadth (EMA_50-based) rather than the per-stock
+    # _classify_market_regime (EMA_200-based). EMA_200 never turns bearish
+    # during intermediate corrections like 2018 (-15%) or 2022 (-17%),
+    # so it was failing to block entries in those bad windows.
     nifty_regime_by_date: dict = {}
     if "_NIFTY50" in all_data:
         nifty_df = all_data["_NIFTY50"]
         for i in range(len(nifty_df)):
             d = nifty_df.index[i].strftime("%Y-%m-%d")
-            nifty_regime_by_date[d] = _classify_market_regime(nifty_df, i)
+            nifty_regime_by_date[d] = _classify_nifty_breadth(nifty_df, i)
 
     # Generate walk-forward windows
     start_dt = datetime.strptime(start_date, "%Y-%m-%d")
